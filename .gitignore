@@ -6,7 +6,6 @@
 /mini/*.img
 /tmp/
 /mini/tmp/
-/packages/*.txz
 /mini/packages/*.txz
 /tools/pkg-static
 /tools/roothack/roothack
