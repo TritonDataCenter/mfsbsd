@@ -42,8 +42,8 @@ fi
 
 gpart destroy -F ${DEVICE}
 gpart create -s gpt ${DEVICE}
-gpart add -s ${SWAPSIZE} -t freebsd-swap -l swap da0
-gpart add -t freebsd-zfs -l zpool da0
+gpart add -s ${SWAPSIZE} -t freebsd-swap -l swap ${DEVICE}
+gpart add -t freebsd-zfs -l zpool ${DEVICE}
 swapon /dev/${DEVICE}p1
 dumpon ${DEVICE}p1
 
