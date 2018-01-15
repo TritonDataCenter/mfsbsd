@@ -1,6 +1,7 @@
 /*.gz
 /*.iso
 /*.img
+/customfiles/etc/buildstamp
 /mini/*.gz
 /mini/*.iso
 /mini/*.img
