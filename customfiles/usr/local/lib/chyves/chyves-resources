@@ -1,0 +1,358 @@
+#!/bin/sh
+
+# Copyright (c) 2016, Justin D Holcomb All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+# Delete guest
+__guest_delete() {
+	local _guest_list="$1"
+	local _force="$2"
+
+	if [ -n "$3" ] && [ "$3" != "force" ] || [ -n "$3" ] && [ "$3" != "keepnet" ]; then
+		__fault_detected_exit "Only 'force' or 'keepnet' are valid parameters for 'chyves $1 delete [force|keepnet]'."
+	fi
+
+	[ "$_guest_list" = all ] && local _guest_list="$_GUEST_NAMES_ACTIVE"
+	[ "$_guest_list" = defaults ] && __fault_detected_exit "Can not delete defaults."
+	[ "$_guest_list" = global ] && __fault_detected_exit "Can not delete global."
+
+	for _guest in `echo $_guest_list | tr ',' ' '`
+	do
+		read -p "[WARNING] Do you want to delete guest: '$_guest' [y/N]? " _delete_or_no </dev/tty
+		case "$_delete_or_no" in
+			y|Y|yes)  __guest_delete_backend "$_guest" "$_force"
+			;;
+			*) __log 1 "Guest '$_guest' was not deleted."
+		esac
+	done
+}
+
+# Backend for deleting guest
+__guest_delete_backend() {
+	local _single_guest="$1"
+	local _force="$2"
+	__load_guest_parameters $_single_guest
+
+	# Check if there are clones
+	if [ "$_force" = "force" ]; then
+		local _clones="$( zfs destroy -nr $_GUEST_pool/chyves/guests/$_GUEST_name 2>&1| grep -E "^$_GUEST_pool" | cut -d'/' -f4 | uniq | tr '\n' ',' )"
+
+		# Delete clones first when 'force' parameter used.
+		if [ -n "$_clones" ]; then
+			__log 1 "$_single_guest has dependent clones. Deleting $_clones first..."
+			__guest_delete "$_clones"
+
+			# Reload parameters for original guest.
+			__load_guest_parameters $_single_guest
+		fi
+	fi
+
+	# This will exit with a non-zero code when there are clones. The -n is a no-op code.
+	zfs destroy -nr $_GUEST_pool/chyves/guests/$_GUEST_name > /dev/null 2>&1
+	[ "$?" != 0 ] && __fault_detected_exit "$_GUEST_name has dependent clones, see 'chyves list clones' or use 'chyves <guest> delete force'."
+
+	# Remove network associations in chyves
+	if [ "$_force" != "keepnet" ] && [ "$_NETWORK_DESIGN_MODE" = "auto" ]; then
+		__log 2 "Removing tap interfaces from $_GUEST_name"
+		if [ -n "$_GP_net_ifaces" ]; then
+			for _iface in `echo $_GP_net_ifaces | tr ',' '\n' | grep tap | tr '\n' ' '`
+			do
+				__network_remove "$_iface"
+			done
+		fi
+	fi
+
+	__log 1 "Deleting guest: '$_GUEST_name'..." -n
+	zfs destroy -r $_GUEST_pool/chyves/guests/$_GUEST_name
+	__log 1 "done."
+	echo ""
+}
+
+# Upgrades guests to the latest 'chyves_guest_version'
+__guest_upgrade_chyves_guest_version() {
+	local _guest_list="$1"
+
+	# If keywoard "all" used, replace with all guest names in comma separated list.
+	[ "$_guest_list" = all ] && local _guest_list="$_GUEST_NAMES_ACTIVE"
+
+	# Multi-guest support.
+	# Eg.: chyves guest1,guest2,guest3 start install.iso
+	for _guest in `echo $_guest_list | tr ',' ' '`
+	do
+		[ "$_guest" = defaults ] && __fault_detected_warning_continue "Can not start defaults."
+		[ "$_guest" = global ] && __fault_detected_warning_continue "Can not start global."
+
+		_GUEST_name=$_guest
+		__load_guest_parameters "$_GUEST_name"
+		__log 1 "$_GUEST_name is on chyves_guest_version $_GP_chyves_guest_version."
+		_RESTRICT_NEW_PROPERTY_NAMES=master-override
+
+		# Change version number and update the global variable.
+		__chyves_guest_version_gvreload_and_set() {
+			local _version="$1"
+			__write_property_value_to_config_file "guest" "chyves_guest_version" "$_version"
+			__load_guest_parameter_single "chyves_guest_version"
+		}
+
+		# Change for addition of 'bhyve_net_type', only checks for value of 'e1000', a missing value causes no harm.
+		if [ "$_GP_chyves_guest_version" -eq "0100" ]; then
+			__log 1 "$_GUEST_name is on an old chyves_guest_version $_GP_chyves_guest_version, upgrading to 0101."
+			__write_property_value_to_config_file "guest" "bhyve_net_type" "$_GDP_bhyve_net_type"
+			__chyves_guest_version_gvreload_and_set "0101"
+		fi
+
+		# Change for addition of 'revert_to_snapshot' and 'revert_to_snapshot_method'. Also adds '-S' to 'bargs' if still set to initial default.
+		if [ "$_GP_chyves_guest_version" -eq "0101" ]; then
+			__load_guest_default_parameters
+			__log 1 "$_GUEST_name is on an old chyves_guest_version $_GP_chyves_guest_version, upgrading to 0102."
+			__write_property_value_to_config_file "guest" "revert_to_snapshot" "$_GDP_revert_to_snapshot"
+			__write_property_value_to_config_file "guest" "revert_to_snapshot_method" "$_GDP_revert_to_snapshot_method"
+
+			# Hosts on FreeBSD 10.3 or later are recommended to use the "-S" bhyve wire memory flag otherwise fun stuff happens at memory starvation.
+			if [ "$_GP_bargs" = "-A -H -P" ]; then
+				__log 1 "Updating 'bargs' value to new use new default."
+				__write_property_value_to_config_file "guest" "bargs" "$_GDP_bargs"
+			fi
+
+			__chyves_guest_version_gvreload_and_set "0102"
+		fi
+
+		# Change for fix when reverting guest when there is a discrepancy in the network configuration. Allows old config to be compared to current config.
+		if [ "$_GP_chyves_guest_version" -eq "0102" ]; then
+			__log 1 "$_GUEST_name is on an old chyves_guest_version $_GP_chyves_guest_version, upgrading to 0200."
+			zfs set snapdir=visible $_GUEST_pool/chyves/guests/$_GUEST_name/.config
+			__chyves_guest_version_gvreload_and_set "0200"
+		fi
+
+		# Changed for new grub-bhyve guests 'openbsd60' and 'coreos'.
+		if [ "$_GP_chyves_guest_version" -eq "200" ]; then
+			__log 1 "$_GUEST_name is on an old chyves_guest_version $_GP_chyves_guest_version, upgrading to 0201."
+			__chyves_guest_version_gvreload_and_set "0201"
+		fi
+
+		# Add bhyveload_flags guest property.
+		if [ "$_GP_chyves_guest_version" -eq "201" ]; then
+			__log 1 "$_GUEST_name is on an old chyves_guest_version $_GP_chyves_guest_version, upgrading to 0202."
+			__load_guest_default_parameters
+			__write_property_value_to_config_file "guest" "bhyveload_flags" "$_GDP_bhyveload_flags"
+			__chyves_guest_version_gvreload_and_set "0202"
+		fi
+
+		# Add bhyve_disk_type guest property.
+		if [ "$_GP_chyves_guest_version" -eq "202" ]; then
+			__log 1 "$_GUEST_name is on an old chyves_guest_version $_GP_chyves_guest_version, upgrading to 0300."
+			__load_guest_default_parameters
+			__write_property_value_to_config_file "guest" "bhyve_disk_type" "$_GDP_bhyve_disk_type"
+			__chyves_guest_version_gvreload_and_set "0300"
+		fi
+
+		# Template
+		#if [ "$_GP_chyves_guest_version" -lt "9900" ]; then
+		#	__log 1 "$_GUEST_name is on an old chyves_guest_version $_GP_chyves_guest_version, upgrading to 9900."
+		#	 <ACTION>
+		#	__chyves_guest_version_gvreload_and_set "9900"
+		#fi
+
+		__log 1 "$_GUEST_name is on the latest chyves_guest_version ($_GP_chyves_guest_version)."
+	done
+}
+
+# Delete ISO and Firmware resources
+__resource_delete() {
+	local _resource_type="$1"    # iso|firmware
+	local _resource_name="$2"    # <resource>
+
+	# Sets the variable to use to for the resource
+	if [ "$_resource_type" = "firmware" ]; then
+		local _resource_type_name="Firmware"
+	elif [ "$_resource_type" = "iso" ]; then
+		local _resource_type_name="ISO"
+	fi
+
+	__verify_valid_dataset "$_resource_type_name/$_resource"
+
+	read -p "[WARNING] Do you want to delete ${_resource_type_name}: '$_resource_name' [y/N]? " _delete_or_no </dev/tty
+	case "$_delete_or_no" in
+		y|Y|yes)  zfs destroy -r $_PRIMARY_POOL/chyves/$_resource_type_name/$_resource_name
+		;;
+		*) __log 1 "The $_resource_type_name, $_resource_name was not deleted."
+	esac
+}
+
+# Rename guest
+__guest_rename() {
+	local _new_name="$1"
+
+	__log 2 "Checking if guest is running... " -n
+	[ -n "$( __return_guest_bhyve_pid )" ] && __fault_detected_exit "Guest ($_GUEST_name) is running, resources locked until guest is stopped."
+	__log 2 "not running."
+
+	read -p "Do you want to rename guest from '$_GUEST_name' to '$_new_name' [y/N]? " _rename_or_no </dev/tty
+	case "$_rename_or_no" in
+		y|Y|yes)   zfs rename $_GUEST_pool/chyves/guests/$_GUEST_name $_GUEST_pool/chyves/guests/$_new_name
+		;;
+		*)         __log 1 "Guest: '$_GUEST_name' not renamed."
+	esac
+}
+
+# Import ISO and Firmware resources into chyves
+__resource_import() {
+	local _resource="$1"
+	local _URL="$2"       # URL|File-Path\File-Name|Firmware-Name
+	local _file_name="$(basename $_URL)"
+
+	# Sets the variable to use to for the resource
+	if [ "$_resource" = "firmware" ]; then
+		local _resource_name="Firmware"
+	elif [ "$_resource" = "iso" ]; then
+		local _resource_name="ISO"
+	elif [ "$_resource" = "guest" ]; then
+		local _resource_name="guests"
+	fi
+
+	# If file ends with .gz|.xz do not use the extension as the folder name.
+	if [ -n "$( echo "$_URL" | grep -E "\.gz$" )" ]; then
+		local _folder_name=$(basename $_file_name .gz)
+	elif [ -n "$( echo "$_URL" | grep -E "\.xz$" )" ]; then
+		local _folder_name=$(basename $_file_name .xz)
+	else
+		local _folder_name=$_file_name
+	fi
+
+	# Check to see if file is on a remote source
+	if [ -n "$(echo "$_URL" | grep -E '^http|^ftp')" ]; then
+		__verify_valid_dataset "$_resource_name/$_folder_name" -check_not_in_use
+
+		# Ensure the file extension is something this can manage to download. Some URLs have crazy authentication or CDN hoops
+		if [ -z "$( echo "$_URL" | grep -E '\.iso$|\.fd$|\.iso\.xz$|\.iso\.gz$' )" ]; then
+			__fault_detected_exit "Unrecognized file extension. Please manually download the file and import it as a: .iso .fd iso.xz or iso.gz file."
+		fi
+
+		__log 2 "Creating ZFS dataset: $_PRIMARY_POOL/chyves/$_resource_name/$_folder_name"
+		zfs create $_PRIMARY_POOL/chyves/$_resource_name/$_folder_name
+
+		# Remote ISOs are downloaded using fetch and hash checked.
+		if [ "$_resource" = "iso" ]; then
+			__log 2 "Please enter a supported hash checksum for '$_file_name':"
+			read -p "Supported cryptographic hash function are (md5|sha1|sha256|sha512|null): " _user_supplied_hash </dev/tty
+
+			__log 2 "Downloading $_file_name from $_URL to /chyves/$_PRIMARY_POOL/$_resource_name/$_folder_name/..."
+			fetch $_URL -o /chyves/$_PRIMARY_POOL/$_resource_name/$_folder_name
+
+			local _hash_length=$( echo $_user_supplied_hash | wc | awk '{ print $3 }' )
+			case "$_hash_length" in
+				33)     local _calcd_chksum=$( md5 -q /chyves/$_PRIMARY_POOL/ISO/$_folder_name/$_file_name )
+				        local _hash_type=MD5
+				;;
+				41)     local _calcd_chksum=$( sha1 -q /chyves/$_PRIMARY_POOL/ISO/$_folder_name/$_file_name )
+				        local _hash_type=SHA1
+				;;
+				65)     local _calcd_chksum=$( sha256 -q /chyves/$_PRIMARY_POOL/ISO/$_folder_name/$_file_name )
+				        local _hash_type=SHA256
+				;;
+				129)    local _calcd_chksum=$( sha512 -q /chyves/$_PRIMARY_POOL/ISO/$_folder_name/$_file_name )
+				        local _hash_type=SHA512
+				;;
+				*)      local _calcd_chksum=""
+				        local _hash_type="Unsupported hash string given. Please contact the chyves developers to have this hash function added."
+			esac
+
+			# Check if hash sums match
+			if [ -z "$_user_supplied_hash" ]; then
+				__log 2 "All that is necessary for the triumph of evil is that good (wo)men do nothing..."
+				__log 2 "...like check their downloaded ISO images against a known hash checksum."
+				__log 1 "No hash checksum given, good luck with your potentially corrupt or manipulated ISO, you facilitator of evil."
+			elif [ "$_calcd_chksum" = "$_user_supplied_hash" ]; then
+				__log 2 "$_hash_type hashes matched."
+			else
+				__log 1 "Hashes did not match for '$_file_name':"
+				__log 2 "Supplied hash:            $_user_supplied_hash"
+				__log 2 "Reason for hash mismatch: $_hash_type"
+				__log 1 "It is recommended to delete '$_file_name', download it again, and supply a supported hash checksum."
+				__resource_functions iso delete "$_folder_name"
+			fi
+
+		# Downloads remote firmware
+		else
+			__log 2 "Downloading : $_file_name"
+			__log 2 "        from: $_URL"
+			__log 2 "          to: /chyves/$_PRIMARY_POOL/$_resource_name/$_folder_name/..."
+			fetch $_URL -o /chyves/$_PRIMARY_POOL/$_resource_name/$_file_name
+		fi
+
+	# Local file copies only.
+	else
+		[ ! -f "$_URL" ] && __fault_detected_exit "File does not exists"
+		__verify_valid_dataset "$_resource_name/$_folder_name" -check_not_in_use
+		__log 2 "Creating ZFS dataset: $_PRIMARY_POOL/chyves/$_resource_name/$_folder_name"
+		zfs create $_PRIMARY_POOL/chyves/$_resource_name/$_folder_name
+		__log 2 "Copying $_file_name from $_URL to /chyves/$_PRIMARY_POOL/$_resource_name/$_folder_name/"
+		cp $_URL /chyves/$_PRIMARY_POOL/$_resource_name/$_folder_name
+	fi
+
+	# Decompress resource if ending in .gz|.xz
+	# These programs delete the original files after decompression
+	if [ -n "$( echo "$_file_name" | grep -E "\.gz$" )" ]; then
+		__log 2 "Decompressing .gz file."
+		gunzip -d /chyves/$_PRIMARY_POOL/ISO/$_folder_name/$_file_name
+		local _file_name="$_folder_name"
+	elif [ -n "$( echo "$_file_name" | grep -E "\.xz$" )" ]; then
+		__log 2 "Decompressing .xz file."
+		xz -d /chyves/$_PRIMARY_POOL/ISO/$_folder_name/$_file_name
+		local _file_name="$_folder_name"
+	fi
+
+	# Checks to see if resource exists now.
+	if [ -e /chyves/$_PRIMARY_POOL/$_resource_name/$_folder_name/$_file_name ]; then
+		__log 1 "$_file_name successfully imported as a chyves $_resource_name resource."
+	else
+		__log 1 "Operation unsuccessful: delete the dataset and try again."
+		__resource_delete $_resource "$_folder_name"
+	fi
+}
+
+# Rename ISO or Firmware resources
+__resource_rename() {
+	local _resource_type="$1"
+	local _resource="$2"          # URL|File-Path\File-Name|Firmware-Name
+	local _new_name="$3"          # Rename-Name
+
+	# Sets the variable to use to for the resource
+	if [ "$_resource_type" = "firmware" ]; then
+		local _resource_type_name="Firmware"
+	elif [ "$_resource_type" = "iso" ]; then
+		local _resource_type_name="ISO"
+	fi
+
+	__verify_valid_dataset "$_resource_type_name/$_resource"
+	__verify_valid_dataset "$_resource_type_name/$_new_name" -check_not_in_use
+
+	read -p "Do you want to rename $_resource_type_name from '$_resource' to '$_new_name' [y/N]? " _rename_or_no </dev/tty
+	case "$_rename_or_no" in
+		y|Y|yes)   mv -f /chyves/$_PRIMARY_POOL/$_resource_type_name/$_resource/$_resource /chyves/$_PRIMARY_POOL/$_resource_type_name/$_resource/$_new_name
+		           zfs rename $_PRIMARY_POOL/chyves/$_resource_type_name/$_resource $_PRIMARY_POOL/chyves/$_resource_type_name/$_new_name
+		;;
+		*)         __log 1 "$_resource_type_name: '$_resource' not renamed."
+	esac
+}

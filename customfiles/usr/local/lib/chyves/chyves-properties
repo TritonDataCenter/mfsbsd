@@ -1,0 +1,878 @@
+#!/bin/sh
+
+# Copyright (c) 2015, pr1ntf (Trent Thompson) All rights reserved.
+# Copyright (c) 2016, Justin D Holcomb All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Frontend interface to get chyves properties
+__get() {
+	local guests="$1"
+	local prop="$2"
+
+	# Multi-guest support.
+	# Eg.: chyves guest1,guest2,guest3 get cpu
+	for name in `echo "$guests" | tr ',' ' '`
+	do
+		_GUEST_name="$name"
+		__gvset_guest_pool
+		_GUEST_config_file="/chyves/$_GUEST_pool/guests/$_GUEST_name/.config/.cfg"
+
+		if [ "$prop" = "all" ]; then
+			echo "Getting all $name's properties..."
+			awk 'BEGIN { FS = "=" } ; { print $1"^"$2 }' $_GUEST_config_file | sort -k1 | column -ts^
+		else
+			__log 1 "$name's $prop=" -n
+			__return_property_value_from_config_file "guest" "$prop"
+		fi
+	done
+}
+
+# Corrects user input when setting RAM properties and size for .defaults
+__get_corrected_byte_nomenclature() {
+	local _var="$1"
+
+	[ -n "$( echo "$_var" | grep -v -E '^[0-9]{1,}$|^[0-9]{1,}[kmgtKMGT]{1}[bB]{0,1}$' )" ] && __fault_detected_exit "Unrecognized size: '$_var', must be any integer and optionally a suffix K, M, G, or T. Megabytes are assumed if not specified."
+
+	# Change to upper case
+	local _var=$( echo "$_var" | tr '[:lower:]' '[:upper:]' )
+
+	# Break _var into two parts number and size suffix
+	local _num=$( echo "$_var" | grep -o -E "[0-9]{1,}" )
+	local _suffix=$( echo "$_var" | grep -o "[kmgtKMGT]" )
+
+	# If no suffix, then use the bhyve default of Megabytes
+	if [ -z "$_suffix" ]; then
+		local _suffix="M"
+	fi
+
+	# If devisable by 1024, then increase the file size denomination
+	while [ "$( expr $_num % 1024 )" -eq 0 ] && [ "$_suffix" != "T" ]
+	do
+		local _num=$( expr $_num / 1024 )
+		[ "$_suffix" = "G" ] && local _suffix="T"
+		[ "$_suffix" = "M" ] && local _suffix="G"
+		[ "$_suffix" = "K" ] && local _suffix="M"
+	done
+
+	_CORRECTED_byte_nomenclature="$_num$_suffix"
+}
+
+# Load single guest parameter from config file to $_GP_($_var)
+__load_global_parameter_single() {
+	local _var="$1"
+	local _value="$( cat $_GLOBAL_CONFIG_FILE | grep -m 1 -E "^$_var=" | cut -d'=' -f2- )"
+	local _var="$( echo $_var | tr '[:lower:]' '[:upper:]' )"
+	_var2="_$_var"
+	export $_var2="$_value"
+	__log 4 "Global property: '$_var' value: '$_value'"
+}
+
+# Load single guest parameter from config file to $_GP_($_var)
+__load_guest_default_parameter_single() {
+	local _var="$1"
+	local _value="$( cat $_DEFAULT_CONFIG_FILE | grep -m 1 -E "^$_var=" | cut -d'=' -f2- )"
+	_var2="_GDP_$_var"
+	export $_var2="$_value"
+	__log 4 "Guest defaults property: '$_var' value: '$_value'"
+}
+
+# Loads .defaults parameters to global variables
+__load_guest_default_parameters() {
+	_GDP_parameters_loaded=1
+
+	# Load all guest parameters in guest config file.
+	for _var in `cat $_DEFAULT_CONFIG_FILE | cut -d'=' -f1`
+	do
+		__load_guest_default_parameter_single "$_var"
+	done
+}
+
+# Load single guest parameter from config file to $_GP_($_var)
+__load_guest_parameter_single() {
+	local _var="$1"
+	local _value="$( cat $_GUEST_config_file | grep -m 1 -E "^$_var=" | cut -d'=' -f2- )"
+	_var2="_GP_$_var"
+	export $_var2="$_value"
+	__log 4 "'$_GUEST_name' property: '$_var' value: '$_value'"
+}
+
+# Load guest parameters to global variables
+__load_guest_parameters() {
+	_GUEST_name="$1"
+	__gvset_guest_pool  # Sets $_GUEST_pool
+	_GUEST_mountpoint="$( __return_guest_dataset_mountpoint )"
+	_GUEST_config_file="$_GUEST_mountpoint/.config/.cfg"
+
+	# Load all guest parameters in guest config file.
+	for _var in `cat $_GUEST_config_file | cut -d'=' -f1`
+	do
+		__load_guest_parameter_single "$_var"
+	done
+
+	_GUEST_wire_memory="$( [ -n "$( echo "$_GP_bargs" | grep '\-S' )" ] && echo "-S" )"
+}
+
+# For use by commands which do not support multi-guest to load parameters
+__load_one_guest_parameters() {
+	__verify_one_guest_supplied "$1"
+	_GUEST_name="$1"
+	__load_guest_parameters $_GUEST_name
+}
+
+# Remove property in guest config file.
+__remove_property_in_guest_config_file() {
+	local _guests_list _property
+	local _guests_list="$1"          # This is script indexed.
+	local _property="$2"
+
+	# If keywoard "all" used, replace with all guest names in comma separated list.
+	[ "$_guests_list" = all ] && local _guests_list="$_GUEST_NAMES_ACTIVE"
+
+	# Multi-guest support.
+	# Eg.: chyves set cpu=8 guest1,guest2,guest3 ram=512M
+	for _guest in `echo "$_guests_list" | tr ',' ' '`
+	do
+		_GUEST_name="$_guest"
+		__gvset_guest_pool "$_GUEST_name"
+		_GUEST_config_file="/chyves/$_GUEST_pool/guests/$_GUEST_name/.config/.cfg"
+
+		[ ! -e "$_GUEST_config_file" ] && __fault_detected_exit "Configuration file not found ($_config_file)."
+
+		if [ -z "$( echo "$_property" | grep -E '^eject_iso_on_n_reboot$|^pcidev_[0-9]{1,3}$|^virtio_block_options_disk[0-9]{1,3}$' )" ]; then
+			__fault_detected_warning_break 1 "Only 'pcidev_{n}' devices can be removed from guests."
+		else
+			__log 2 "Removing $_property property from $_GUEST_name"
+			echo "$( grep -v -E "^$_property=" $_GUEST_config_file )" > $_GUEST_config_file
+		fi
+
+	done
+}
+
+# Get all chyves properties that are set on the system
+__return_property_list() {
+	local _flags="$1"
+	local _guest="$2"
+	# $null   Get a list of guest properties
+	# -a      [all] Get a list of all guest properties including .defaults
+	# -d      [defaults] Get a list of .defaults only properties
+	# -c      [config] Get a list of .config only properties
+
+	# Properties for a particular guest
+	if [ -n "${_guest}" ]; then
+		__gvset_guest_pool
+		cat "$_GUEST_config_file" | cut -d'=' -f1 | sort | uniq
+
+	# All properties
+	elif [ "${_flags}" = "-a" ]; then
+		cat /chyves/*/guests/*/.config/.cfg /chyves/*/guests/.defaults /chyves/*/.config/*.cfg | cut -d'=' -f1 | sort | uniq
+
+	# Properties for defaults only
+	elif [ "${_flags}" = "-d" ]; then
+		cat $_DEFAULT_CONFIG_FILE | cut -d'=' -f1 | sort | uniq
+
+	# Global and pool properties only
+	elif [ "${_flags}" = "-c" ]; then
+		cat /chyves/*/.config/*.cfg | cut -d'=' -f1 | sort | uniq
+
+	# All guests properties
+	else
+		cat /chyves/*/guests/*/.config/.cfg | cut -d'=' -f1 | sort | uniq
+	fi
+}
+
+# Returns property value from config file.
+__return_property_value_from_config_file() {
+	local _config_file _guest_message _manual_declare _type _value _var
+	local _type="$1"     # global|guest|defaults|manual
+	local _var="$2"
+	local _manual_declare="$3"
+
+	# Set the config file location.
+	if [ "$_type" = "global" ]; then
+		local _config_file="$_GLOBAL_CONFIG_FILE"
+	elif [ "$_type" = "defaults" ]; then
+		local _config_file="$_DEFAULT_CONFIG_FILE"
+	elif [ "$_type" = "guest" ]; then
+		local _config_file="$_GUEST_config_file"
+	elif [ "$_type" = "manual" ]; then
+		local _config_file="$_manual_declare"
+	fi
+
+	[ ! -e "$_config_file" ] && __fault_detected_exit "Configuration file not found ($_config_file)."
+
+	# Print the value
+	local _value="$( grep -m 1 -E "^$_var=" $_config_file | cut -d'=' -f2- )"
+	[ "$_type" = "guest" ] && __log 4 "Returning value for a $_type, property: '$_var' value: '$_value' for guest: '$_GUEST_name'"
+	[ ! "$_type" = "guest" ] && __log 4 "Returning value for a $_type, property: '$_var' value: '$_value'"
+	echo $_value
+}
+
+# Frontend interface to set chyves properties
+__set() {
+	local _guests_list _lastguest _prop _val
+	local _guests_list="$1"          # This is script indexed.
+
+	# If keywoard "all" used, replace with all guest names in comma separated list.
+	[ "$_guests_list" = all ] && local _guests_list="$_GUEST_NAMES_ACTIVE"
+
+	shift 2   # Keep from setting "set" or guest name as a property.
+	for arg in "$@"; do
+
+		# Guest name detector
+		if [ -z "$( echo "$arg" | grep '=' )" ]; then
+			local _guests_list="$arg"
+
+			# If keywoard "all" used, replace with all guest names in comma separated list.
+			[ "$_guests_list" = all ] && local _guests_list="$_GUEST_NAMES_ACTIVE"
+
+			__verify_guests $arg
+
+			# Skip remaining loop, as it is property specific.
+			continue
+		fi
+
+		# Multi-guest support.
+		# Eg.: chyves set cpu=8 guest1,guest2,guest3 ram=512M
+		for _guest in `echo "$_guests_list" | tr ',' ' '`
+		do
+			_GUEST_name="$_guest"
+
+			# Set the pool when no pool is set or if new guest is being used.
+			if [ "$_GUEST_name" != "$_lastguest" ]; then
+				if [ "$_GUEST_name" = "global" ]; then
+					__log 2 "Switching to setting properties for global on: $_PRIMARY_POOL"
+					local _type="$_GUEST_name"
+				elif [ "$_GUEST_name" = "defaults" ]; then
+					__log 2 "Switching to setting properties for defaults on: $_PRIMARY_POOL"
+					local _type="$_GUEST_name"
+				else
+					__log 2 "Switching to setting properties for guest: $_GUEST_name"
+					__gvset_guest_pool "$_GUEST_name"
+					_GUEST_config_file="/chyves/$_GUEST_pool/guests/$_GUEST_name/.config/.cfg"
+					local _type="guest"
+				fi
+			fi
+
+			# Parse property name and desired value from $arg (aka positional parameter)
+			local _prop="$( echo $arg | cut -d '=' -f1 )"
+			local _val="$( echo $arg | cut -d '=' -f2- )"
+
+			__verify_user_input_for_properties "$_prop" "$_val" "$_type"
+
+			# Update value if adjusted
+			if [ -n "$_ADJUSTED_value" ]; then
+				__log 3 "Value adjust from '$_val' to '$_ADJUSTED_value'."
+				local _val="$_ADJUSTED_value"
+			fi
+
+			# Use function to set ZFS property
+			if [ "$_guest" = "global" ]; then
+				__write_property_value_to_config_file "global" "$_prop" "$_val"
+			elif [ "$_guest" = "defaults" ]; then
+				__write_property_value_to_config_file "defaults" "$_prop" "$_val"
+			else
+				__write_property_value_to_config_file "guest" "$_prop" "$_val"
+			fi
+
+			# Used to save some cycles
+			local _lastguest="$_GUEST_name"
+
+		done
+	done
+}
+
+# Middleware for setting properties, verifies user input for properties.
+__verify_user_input_for_properties() {
+	local _property _resource _value
+	local _property="$1"
+	local _value="$2"
+	local _resource="$3"
+	_ADJUSTED_value=""        # Needs to be reset due to being reused and global.
+
+	# This statement should never normally be met but intended for debugging.
+	if [ "$_resource" = "" ]; then
+		__fault_detected_exit "No resource type supplied for $_property, aborting."
+
+	# Guest and Defaults share many common properties. Last elif handles properties unique to defaults.
+	elif [ "$_resource" = "guest" ] || [ "$_resource" = "defaults" ]; then
+
+# bhyve_disk_type
+		if [ "$_property" = "bhyve_disk_type" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^virtio-blk$|^ahci-hd$' )" ]; then
+				__fault_detected_warning_break 1 "Unrecognized 'bhyve_disk_type' type. Recognized values are 'virtio-blk' or 'ahci-hd'."
+			fi
+
+# bhyve_net_type
+		elif [ "$_property" = "bhyve_net_type" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^virtio-net$|^e1000$' )" ]; then
+				__fault_detected_warning_break 1 "Unrecognized 'bhyve_net_type' type. Recognized values are 'virtio-net' or 'e1000'."
+			fi
+
+# cpu
+		elif [ "$_property" = "cpu" ]; then
+			if [ "$_value" -gt "16" ]; then
+				_ADJUSTED_value="16"
+				__log 1 "bhyve has a 16 CPU core limit. Setting cpu=16"
+			fi
+			if [ "$_value" -lt "1" ]; then
+				_ADJUSTED_value="1"
+				__log 1 "bhyve must be assigned at least one core. Setting cpu=1"
+			fi
+
+# chyves_guest_version
+		elif [ "$_property" = "chyves_guest_version" ]; then
+			__fault_detected_warning_break 1 "Not user settable."
+
+# eject_iso_on_n_reboot
+		elif [ "$_property" = "eject_iso_on_n_reboot" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^[0-9]{1,}$' )" ]; then
+				__fault_detected_warning_break 1 "Value must be a whoe number, use '0' to turn off."
+			fi
+
+# loader
+		elif [ "$_property" = "loader" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^uefi$|^bhyveload$|^grub-bhyve$' )" ]; then
+				__fault_detected_warning_break 1 "Unrecognized loader type. Recognized values are bhyveload, grub-bhyve, uefi"
+			fi
+
+			# Special handling for UEFI guests
+			if [ "$_value" = "uefi" ]; then
+				local _uefi_parameters="$( grep -c -E "^uefi_.*" /chyves/$_GUEST_pool/guests/$_GUEST_name/.config/.cfg )"
+
+				# Check to see if uefi property has been previously set.
+				if [ "$_uefi_parameters" = "0" ]; then
+					__log 2 "\nTurning on UEFI properties, using defaults to set values." -e
+					__load_guest_default_parameters
+					__get_next_vnc_port
+					local _previous_restrict_state="$_RESTRICT_NEW_PROPERTY_NAMES"
+					_RESTRICT_NEW_PROPERTY_NAMES="master-override"                 # If this is the first guest with UEFI the following properties would fail to be set without this.
+					__write_property_value_to_config_file "guest" "uefi_console_output"                  "$_GDP_uefi_console_output"
+					__write_property_value_to_config_file "guest" "uefi_firmware"                        "$_GDP_uefi_firmware"
+					_RESTRICT_NEW_PROPERTY_NAMES="$_previous_restrict_state"       # Turn back to previous state.
+				else
+					__log 2 "Existing UEFI configuration on guest."
+				fi
+			fi
+
+# net_ifaces
+		elif [ "$_property" = "net_ifaces" ]; then
+			if [ "$_NETWORK_DESIGN_MODE" = "auto" ]; then
+				__fault_detected_warning_break 1 "Not user settable while network design mode is set to auto."
+			elif [ "$_NETWORK_DESIGN_MODE" = "system" ]; then
+
+				# This verifies the correct interface format.
+				__log 1 "Checking valid values for 'net_ifaces' due to network design mode set as system."
+				for _iface in `echo $_value | tr ',' ' '`
+				do
+					if [ -z "$( echo "$_iface" | grep -E '^tap[0-9]{1,5}$|^vale[0-9a-zA-Z]{1,9}(:[a-zA-Z]{1}|:[0-9]{1,4}){0,1}$' )" ]; then
+						__fault_detected_exit "Incorrect interface format: $_iface"
+					fi
+				done
+			fi
+
+# os
+		elif [ "$_property" = "os" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^openbsd60$|^openbsd59$|^openbsd58$|^openbsd57$|^netbsd$|^debian$|^d8lvm$|^centos6$|^centos7$|^arch$|^gentoo$|^coreos$|^coreossecure$|^custom$|^default$' )" ]; then
+				__log 1 "Unrecognized os type. Valid values are required for grub-bhyve guests to boot properly. See man page for valid values."
+			fi
+
+# pcidev_{n}
+		elif [ -n "$( echo "$_property" | grep '^pcidev_[0-9]{1,3}$' )" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^passthru,[0-9]{1,3}\/[0-9{1,3}\/[0-9{1,3}$' )" ]; then
+				__log 2 "valid PCI passthru format " -n
+			elif [ "$_value" = "virtio-rnd" ]; then
+				__log 2 "valid RNG " -n
+			else
+				__log 1 "No input verification written for '$_property' property. Beware of dragons."
+			fi
+
+# ram
+		elif [ "$_property" = "ram" ]; then
+			__get_corrected_byte_nomenclature "$_value"
+			_ADJUSTED_value="$_CORRECTED_byte_nomenclature"
+
+# rcboot
+		elif [ "$_property" = "rcboot" ]; then
+			if [ -n "$( echo "$_value" | tr '[:lower:]' '[:upper:]' | grep -E '^NO$|^N$' )" ]; then
+				__log 2 "Correct syntax is to use '0' rather than '$value'."
+				_ADJUSTED_value=0
+			elif [ -z "$( echo "$_value" | grep -E '^[0-9]{1,}$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for 'rcboot' property is any positive integer or zero."
+			fi
+
+# revert_to_snapshot
+		elif [ "$_property" = "revert_to_snapshot" ]; then
+			__log 2 "Verifying snapshot declared in 'revert_to_snapshot'... " -n
+			__verify_valid_dataset "guests/$_GUEST_name/"
+			__log 2 "done"
+
+# revert_to_snapshot_method
+		elif [ "$_property" = "revert_to_snapshot_method" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^both$|^off$|^reboot$|^start$' )" ]; then
+				__fault_detected_warning_break 1 "Unrecognized 'revert_to_snapshot_method' value. Recognized values are both, off, reboot, or start."
+			fi
+
+# serial
+		elif [ "$_property" = "serial" ]; then
+
+			__log 2 "Checking if guest is running... " -n
+			[ -n "$( __return_guest_bhyve_pid )" ] && __fault_detected_warning_continue "Can not change console while '$_GUEST_name' is running."
+			__log 2 "not running."
+
+			if [ -z "$( echo "$_value" | grep -E '^nmdm[0-9]{1,}$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for 'serial' property is 'nmdm' followed by any unique positive integer."
+			fi
+			echo "It is not recommmended to set this property manually."
+
+# tap{n}_mac
+		elif [ -n "$( echo "$_property" | grep -E '^tap[0-9]{1,5}_mac$' )" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}$' )" ]; then
+				__fault_detected_warning_break 1 "Correct value for '$_property' is a MAC address in ethers(5) format. Example: 58:9C:FC:00:00:00 or 58:9c:fc:00:00:00"
+			fi
+
+# template
+		elif [ "$_property" = "template" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^yes$|^no$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for '$_property' property is 'yes' or 'no'."
+			fi
+
+			[ -n "$( __return_guest_bhyve_pid )" ] && __fault_detected_warning_break 1 "Can not set running guest as template while running."
+
+			# Further action to take to (un)set dataset as read only. First start by unmounting the dataset.
+			__log 2 "Unmounting guest dataset... " -n
+			zfs umount -f $_GUEST_pool/chyves/guests/$_GUEST_name
+			[ "$?" != 0 ] && __fault_detected_warning_break 1 "Can not unmount guest dataset. Please try setting 'template' to '$_value' again."
+			__log 2 "done."
+
+			# If 'yes' turn on readonly, if 'no' turn off.
+			if [ "$_value" = "yes" ]; then
+				__log 1 "Setting guest datasets to be read-only."
+				zfs set readonly=on $_GUEST_pool/chyves/guests/$_GUEST_name
+				if [ "$?" != 0 ]; then
+					# Abort
+					zfs get -r readonly $_GUEST_pool/chyves/guests/$_GUEST_name
+					zfs mount $_GUEST_pool/chyves/guests/$_GUEST_name
+					__fault_detected_warning_break 1 "Can not set guest dataset to read only. Please try setting 'template' to 'yes' again. Manual intervention may be required."
+				else
+					# Unset readonly, set template to yes, and then reset readonly. Wanted to see if it was possible before making it impossible to write the value to 'yes'.
+					zfs set readonly=off $_GUEST_pool/chyves/guests/$_GUEST_name
+					zfs mount $_GUEST_pool/chyves/guests/$_GUEST_name/.config
+					__write_property_value_to_config_file "guest" "template" "yes"
+					zfs umount -f $_GUEST_pool/chyves/guests/$_GUEST_name/.config
+					zfs set readonly=on $_GUEST_pool/chyves/guests/$_GUEST_name
+					__log 2 "Successfully changed guest's datasets to readonly. Any and all future changes to this guest will fail until 'template' is set back to 'no'."
+				fi
+			elif [ "$_value" = "no" ]; then
+				__log 1 "Setting guest datasets to be writable."
+				zfs set readonly=off $_GUEST_pool/chyves/guests/$_GUEST_name
+				if [ "$?" != 0 ]; then
+					# Abort
+					zfs get -r readonly $_GUEST_pool/chyves/guests/$_GUEST_name
+					zfs mount $_GUEST_pool/chyves/guests/$_GUEST_name
+					__fault_detected_warning_break 1 "Can not set guest dataset to writeable. Please try setting 'template' to 'no' again. Manual intervention may be required."
+				else
+					__log 2 "Successfully changed guest's datasets to writeable."
+				fi
+			fi
+
+			# Remount dataset.
+			__log 2 "Mounting guest datasets... "
+			for _dataset in `zfs list -H -r -o name -t filesystem $_GUEST_pool/chyves/guests/$_GUEST_name | tr '\n' ' '`
+			do
+				zfs mount $_dataset
+				if [ "$?" = 0 ]; then
+					__log 2 "                           $_dataset."
+				else
+					__log 2 "Failed to mount datasets: $_dataset"
+				fi
+			done
+
+# uefi_console_output
+		elif [ "$_property" = "uefi_console_output" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^serial$|^vnc$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for 'uefi_console_output property is 'serial' or 'vnc'."
+			fi
+
+			# Special handling for UEFI guests
+			if [ "$_value" = "vnc" ]; then
+				local _uefi_vnc_parameters="$( grep -c -E "^uefi_vnc_.*" /chyves/$_GUEST_pool/guests/$_GUEST_name/.config/.cfg )"
+
+				# Check to see if uefi property has been previously set.
+				if [ "$_uefi_vnc_parameters" = "0" ]; then
+					__log 2 "\nTurning on UEFI VNC properties, using defaults to set values." -e
+					__load_guest_default_parameters
+					__get_next_vnc_port
+					local _previous_restrict_state="$_RESTRICT_NEW_PROPERTY_NAMES"
+					_RESTRICT_NEW_PROPERTY_NAMES="master-override"                 # If this is the first guest with UEFI VNC settings the following properties would fail to be set without this.
+					__write_property_value_to_config_file "guest" "uefi_vnc_client"                      "$_GDP_uefi_vnc_client"
+					__write_property_value_to_config_file "guest" "uefi_vnc_client_custom_cmd"           ""
+					__write_property_value_to_config_file "guest" "uefi_vnc_pause_until_client_connect"  "$_GDP_uefi_vnc_pause_until_client_connect"
+					__write_property_value_to_config_file "guest" "uefi_vnc_port"                        "$_NEXT_vnc_port"
+					__write_property_value_to_config_file "guest" "uefi_vnc_mouse_type"                  "$_GDP_uefi_vnc_mouse_type"
+					__write_property_value_to_config_file "guest" "uefi_vnc_ip"                          "$_GDP_uefi_vnc_ip"
+					__write_property_value_to_config_file "guest" "uefi_vnc_res"                         "$_GDP_uefi_vnc_res"
+					_RESTRICT_NEW_PROPERTY_NAMES="$_previous_restrict_state"       # Turn back to previous state.
+				else
+					__log 2 "Existing UEFI VNC configuration on guest."
+				fi
+			fi
+
+# uefi_firmware
+		elif [ "$_property" = "uefi_firmware" ]; then
+			__log 2 "Verifying firmware resource dataset... " -n
+			__verify_valid_dataset "Firmware/$_value"
+			__log 2 "done"
+
+# uefi_vnc_mouse_type
+		elif [ "$_property" = "uefi_vnc_mouse_type" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^ps2$|^usb3$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for 'uefi_vnc_mouse_type' is 'ps2' or 'usb3'."
+			fi
+
+# uefi_vnc_pause_until_client_connect
+		elif [ "$_property" = "uefi_vnc_pause_until_client_connect" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^yes$|^no$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for 'uefi_vnc_pause_until_client_connect' is 'yes' or 'no'."
+			fi
+
+# uefi_vnc_client
+		elif [ "$_property" = "uefi_vnc_client" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^custom$|^freerdp$|^off$|^print$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for 'uefi_vnc_client' is 'custom', 'freerdp', 'off', or 'print'."
+			fi
+
+# uefi_vnc_ip
+		elif [ "$_property" = "uefi_vnc_ip" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}$' )" ]; then
+				__fault_detected_warning_break 1 "Correct value for '$_property' is an IPv4 address. Example: 192.168.100.2"
+			fi
+
+			# Check IP octets are correct.
+			for _octet in `echo "$_value" | tr '.' ' '`
+			do
+				if [ "$_octet" -gt 255 ] || [ "$_octet" -lt 0 ]; then
+					__fault_detected_warning_break 1 "Invalid IPv4 octet value"
+				fi
+			done
+
+			# Check if IP is configured on system.
+			if [ "$_value" = "0.0.0.0" ]; then
+				__log 2 "Keep in mind, using the default value '0.0.0.0' for '$_property' does pose a security risk."
+			elif [ -z "$( echo "$_value" | grep -E "$( __return_new_line_delimit_as_grep_string "$( ifconfig | grep inet | awk '{ print $2 }' | grep -E '^[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}$' )" )" )" ]; then
+				__log 1 "IPv4 address ($_value), not found on system. Connection to VNC will fail."
+			fi
+
+# uefi_vnc_port
+		elif [ "$_property" = "uefi_vnc_port" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^[0-9]{1,5}$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for '$_property' property is a positive integer 0 through 65535."
+			fi
+			if [ "$_value" -lt 0 ] || [ "$_value" -gt 65535 ]; then
+				__fault_detected_warning_break 1 "Correct values for '$_property' property is a positive integer within 0 through 65535 range."
+			fi
+
+# uefi_vnc_res
+		elif [ "$_property" = "uefi_vnc_res" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^1920x1200$|^1920x1080$|^1600x1200$|^1600x900$|^1280x1024$|^1280x720$|^1024x768$|^800x600$|^640x480$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for 'uefi_vnc_res' are in the man page."
+			fi
+
+# uuid
+		elif [ "$_property" = "uuid" ]; then
+			if [ -z "$( echo "$_value" | grep -E '$_UUID_CHECK_GREP_STRING' )" ]; then
+				__fault_detected_warning_break 1 "Value for '$_property', not in UUID format. Example: '21EC2020-3AEA-4069-A2DD-08002B30309D'"
+			fi
+
+# virtio_block_options_disk{n}
+			elif [ -n "$( echo "$_property" | grep -E '^virtio_block_options_disk[0-9]{1,}$' )" ]; then
+				__log 2 "Ubuntu slaugters kittens, don't be like Ubuntu."
+				__log 2 "Let's hope you know what you are doing, no input verification written for '$_property' property. Beware of dragons."
+
+#
+# Verify properties unique to defaults. This always needs to be just before the else catch all.
+#
+		elif [ "$_resource" = "defaults" ]; then
+
+# bridge
+			if [ "$_property" = "bridge" ]; then
+				__verify_valid_iface_format $_value
+				if [ "$_IFACE_type" != "bridge" ]; then
+					__fault_detected_warning_break 1 "Valid value for 'bridge' must be a bridge name."
+				fi
+
+# disk_compression
+			elif [ "$_property" = "disk_compression" ]; then
+				if [ -z "$( echo "$_value" | grep -E '^on$|^off$|^lzjb$|^gzip$|^gzip-[1-9]{1}$|^zle$|^lz4$|^inherit$' )" ]; then
+					__fault_detected_warning_break 1 "Invalid value for '$_property', think of the kittens."
+				fi
+
+# disk_primarycache & disk_secondarycache
+			elif [ "$_property" = "disk_primarycache" ] || [ "$_property" = "disk_secondarycache" ]; then
+				if [ -z "$( echo "$_value" | grep -E '^all$|^none$|^metadata$|^inherit$' )" ]; then
+					__fault_detected_warning_break 1 "Invalid value for '$_property', think of the kittens."
+				fi
+
+# disk_volblocksize
+			elif [ "$_property" = "disk_volblocksize" ]; then
+				__gvset_user_input_to_bytes "$_value"
+				_ADJUSTED_value="$_USER_input_to_bytes"
+				if [ "$_ADJUSTED_value" -gt 131072 ]; then
+					__fault_detected_warning_break 1 "Invalid value for '$_property', think of the kittens."
+				fi
+
+# disk_volmode
+			elif [ "$_property" = "disk_volmode" ]; then
+				if [ -z "$( echo "$_value" | grep -E '^geom$|^dev$|^inherit$' )" ]; then
+					__fault_detected_warning_break 1 "Invalid value for '$_property', think of the kittens."
+				fi
+				if [ "$_value"="geom" ]; then
+					__log 1 "[WARNING] While setting the value for 'disk_volmode' to 'geom' will work, the host OS can interfere and possibly corrupt the guest disk."
+				fi
+
+# size
+			elif [ "$_property" = "size" ]; then
+				__get_corrected_byte_nomenclature "$_value"
+				_ADJUSTED_value="$_CORRECTED_byte_nomenclature"
+			fi
+
+# Catch all for guests.
+		else
+			__log 1 "No input verification for guest '$_property' property written. Beware of dragons."
+		fi
+
+#
+# Verify global properties
+#
+	elif [ "$_resource" = "global" ]; then
+
+# auto_load_kernel_mods
+		if [ "$_property" = "auto_load_kernel_mods" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^no$|^yes$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are 'yes' or 'no'"
+			fi
+
+# bridge{n}_tap_members
+		elif [ -n "$( echo "$_property" | grep -E '^bridge[0-9]{1,5}_tap_members$' )" ]; then
+			__fault_detected_warning_break 1 "Use 'chyves network' to indirectly manage property: '$_property'."
+
+# check_for_updates
+		elif [ "$_property" = "check_for_updates" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^daily$|^weekly$|^monthly$|^always$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are: daily, weekl, monthly, and always."
+			fi
+
+# check_for_updates_last_check
+		elif [ "$_property" = "check_for_updates_last_check" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^20[0-9]{2}[01]{1}[0-9]{1}[0-3]{1}[0-9]{1}$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', must be in YYYYMMDD."
+			fi
+
+# check_for_updates_last_check_status
+		elif [ "$_property" = "check_for_updates_last_check_status" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^0$|^1$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are '0' or '1'."
+			fi
+
+# check_for_updates_timeout_seconds
+		elif [ "$_property" = "check_for_updates_timeout_seconds" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^[0-9]{1,}$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property'."
+			fi
+
+# check_for_updates_unique_id
+		elif [ "$_property" = "check_for_updates_unique_id" ]; then
+			if [ -z "$( echo "$_value" | grep -E '$_UUID_CHECK_GREP_STRING' )" ]; then
+				__fault_detected_warning_break 1 "Value for '$_property', not in UUID format. Example: '21EC2020-3AEA-4069-A2DD-08002B30309D'"
+			fi
+
+# chyves_version
+		elif [ "$_property" = "chyves_version" ]; then
+			__fault_detected_warning_break 1 "Not user settable."
+
+# chyves_version_int
+		elif [ "$_property" = "chyves_version_int" ]; then
+			__fault_detected_warning_break 1 "Not user settable."
+
+# console_start_offset
+		elif [ "$_property" = "console_start_offset" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^[0-9]{1,}$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property'."
+			fi
+
+# consolidate_bhyve_pci_devices
+		elif [ "$_property" = "consolidate_bhyve_pci_devices" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^yes$|^no$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are 'yes' or 'no'."
+			fi
+
+# dataset_role
+		elif [ "$_property" = "dataset_role" ]; then
+			__fault_detected_warning_break 1 "Not user settable, use 'chyves dataset' to manage."
+
+# dataset_version
+		elif [ "$_property" = "dataset_version" ]; then
+			__fault_detected_warning_break 1 "Not user settable, use 'chyves dataset' to manage."
+
+# default_info_flags
+		elif [ "$_property" = "default_info_flags" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^-[zbprvstcdnakl]{1,}$|^-h$' )" ] && [ -n "$_value" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', see 'chyves info -h' for valid values."
+			fi
+
+# default_list_flags
+		elif [ "$_property" = "default_list_flags" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^-[zbprvstcdnakl]{1,}$|^-h$' )" ] && [ -n "$_value" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', this function share the same backend as 'chyves info' see man page for valid values."
+			fi
+
+# dev_mode
+		elif [ "$_property" = "dev_mode" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^on$|^off$|^-[xvn]{1}$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property'."
+			fi
+
+# log_mode
+		elif [ "$_property" = "log_mode" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^host$|^guest$|^dual$|^off$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are 'host', 'guest', or 'dual'."
+			fi
+
+# log_to_file
+		elif [ "$_property" = "log_to_file" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^on$|^off$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are 'on' or 'off'."
+			fi
+
+# network_design_mode
+		elif [ "$_property" = "network_design_mode" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^auto$|^system$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are 'auto' or 'system'."
+			fi
+
+# restrict_new_property_names
+		elif [ "$_property" = "restrict_new_property_names" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^on$|^off$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are 'on' and 'off'."
+			fi
+
+# stdout_level
+		elif [ "$_property" = "stdout_level" ]; then
+			if [ -z "$( echo "$_value" | grep -E '[0-3]{1}' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are '0', '1', '2', or '3'. See man page for meaning."
+			fi
+
+# tap_start_offset
+		elif [ "$_property" = "tap_start_offset" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^[0-9]{1,5}$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for '$_property' is a positive integer 0 through 32768."
+			elif [ "$_value" -lt 0 ] && [ "$_value" -gt 32768 ]; then
+				__fault_detected_warning_break 1 "Correct values for '$_property' is a positive integer 0 through 32768."
+			fi
+
+# tap_up_by_default
+		elif [ "$_property" = "tap_up_by_default" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^yes$|^no$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are 'yes' or 'no'. "
+			fi
+
+# uefi_vnc_port_start_offset
+		elif [ "$_property" = "uefi_vnc_port_start_offset" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^[0-9]{1,5}$' )" ]; then
+				__fault_detected_warning_break 1 "Correct values for '$_property' is a positive integer 0 through 65535."
+			elif [ "$_value" -lt 0 ] && [ "$_value" -gt 65535 ]; then
+				__fault_detected_warning_break 1 "Correct values for '$_property' is a positive integer 0 through 65535."
+			fi
+
+# vlan_iface_base_name
+		elif [ "$_property" = "vlan_iface_base_name" ]; then
+			if [ -z "$( echo "$_value" | grep -E '^[a-z]{1,}$' )" ]; then
+				__fault_detected_warning_break 1 "Invalid value for '$_property', valid values are any alphabetic words."
+			fi
+		fi
+	fi
+}
+
+# Writes config to file.
+__write_property_value_to_config_file() {
+	local _config_file _guest_message _manual_declare _type _value _var
+	local _type="$1"     # global|guest|defaults|manual
+	local _var="$2"
+	local _value="$3"
+	local _manual_declare="$4"
+
+	# Set the config file location.
+	if [ "$_type" = "global" ]; then
+		local _config_file="$_GLOBAL_CONFIG_FILE"
+	elif [ "$_type" = "defaults" ]; then
+		local _config_file="$_DEFAULT_CONFIG_FILE"
+	elif [ "$_type" = "guest" ]; then
+		local _config_file="$_GUEST_config_file"
+		local _guest_message="for guest $_GUEST_name"
+	elif [ "$_type" = "manual" ]; then
+		local _config_file="$_manual_declare"
+	fi
+
+	[ ! -e "$_config_file" ] && __fault_detected_exit "Configuration file not found ($_config_file)."
+
+	# Remove old value if set but exit if property does not exist and $_RESTRICT_NEW_PROPERTY_NAMES is set to 'on'.
+	if [ -n "$( grep -E "^$_var=.*" $_config_file )" ]; then
+		echo "$( grep -v -E "^$_var=" $_config_file )" > $_config_file
+	else
+
+		# Do not ever allow for setting new defaults properties, to prevent confusion (except for setup)
+		if [ "$_type" = "defaults" ] && [ "$_RESTRICT_NEW_PROPERTY_NAMES" != "master-override" ]; then
+			local _valid_properties=$( __return_property_list -d )
+			local _string_to_grep=$( __convert_list_to_grep_string "$_valid_properties" )
+			if [ -z "$( echo "$_var" | grep -w -E "$_string_to_grep" )" ]; then
+				__fault_detected_exit "$_var is not a defined defaults property. \nCreating new properties for defaults is not possible."
+			fi
+
+		# Do not ever allow for setting new .config properties except bridge{n}_phy_attach and bridge{n}_tap_members, this is to prevent confusion.
+		# $2 in __convert_list_to_grep_string under _string_to_grep is what is needed to allow setting bridge{n}_phy_attach and bridge{n}_tap_members as needed.
+		# Use "set" directly is not recommended as it is not fully restrictive and will allow invalid bridge numbers be used which will later fail.
+		elif [ "$_type" = "global" ] && [ "$_RESTRICT_NEW_PROPERTY_NAMES" != "master-override" ]; then
+			local _valid_properties="$( __return_property_list -c )"
+			local _string_to_grep="$( __convert_list_to_grep_string "$_valid_properties" "^bridge([0-9]{1,5})_phy_attach$|^bridge([0-9]{1,5})_tap_members$" )"
+			if [ -z "$( echo "$_var" | grep -w -E "$_string_to_grep" )" ]; then
+				__fault_detected_exit "$_var is not a defined global property. \nCreating new properties for global is not possible."
+			fi
+
+		# Property control for guests.
+		elif [ "$_NUMBER_OF_ALL_GUESTS" -gt 0 ] && [ "$_RESTRICT_NEW_PROPERTY_NAMES" != "master-override" ]; then
+			# If new property restrition is on, see if a new property name is being supplied.
+			if [ "$_RESTRICT_NEW_PROPERTY_NAMES" = "on" ] && [ "$_NUMBER_OF_ALL_GUESTS" -gt "0" ]; then
+				local _valid_properties=$( __return_property_list -a )
+				local _string_to_grep=$( __convert_list_to_grep_string "$_valid_properties" "^eject_iso_on_n_reboot$|^pcidev_[0-9]{1,3}$|^tap[0-9]{1,5}_mac$|^template$|^virtio_block_options_disk[0-9]{1,5}$" )
+				if [ -z "$( echo "$_var" | grep -w -E "$_string_to_grep" )" ]; then
+					__fault_detected_exit "$_var is not a defined guest property and creation of new property creation is set to off, see 'restrict_new_property_names'."
+				fi
+			fi
+		fi
+	fi
+
+	# Set the value for the property.
+	__log 2 "Setting $_type property '$_var' to value: '$_value' $_guest_message"
+
+	# Append value to config file
+	echo "$_var=$_value" >> $_config_file
+}

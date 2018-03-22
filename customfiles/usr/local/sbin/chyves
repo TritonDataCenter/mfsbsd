@@ -1,0 +1,422 @@
+#!/bin/sh
+
+# Copyright (c) 2015, pr1ntf (Trent Thompson) All rights reserved.
+# Copyright (c) 2016, Justin D Holcomb All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#### Library
+# The chyves project split the main binary (this file) into library files with
+# the blame and history maintained in May of 2016. Each library file contains
+# functions that only handle one aspect of chyves. This was done for the
+# developers' sanity. Below is a table of contents for the functions in each
+# library file. This TOC is most helpful for casual, curious users but it should
+# also be helpful for developers as well.
+#
+### Table of Contents:
+#
+## ../lib/chyves-basics                      ## Functions that are basic to chyves functionality
+# __convert_list_to_grep_string()             # List can be delimited by a single space for each item or a new line
+# __freenas_create_symbolic_link()            # Creates a symbolic link for non-OS pools on FreeNAS
+# __gvset_guest_name_by_pid()                 # Get guests name by supplied pid and set GV
+# __gvset_guest_pool()                        # Get pool name for guest and set GV
+# __gvset_primary_pool()                      # Get primary pool name and set GV
+# __gvset_user_input_to_bytes()               # Converts user input to bytes
+# __help()                                    # Print help page
+# __parse_cmd_ingress()                       # First stage to process command line parameters for chyves
+# __parse_cmd_console()                       # Command parser for console tasks
+# __parse_cmd_dataset()                       # Command parser for dataset
+# __parse_cmd_disk()                          # Command parser for disk manipulations on guests
+# __parse_cmd_list()                          # Command parser for list commands on guests
+# __parse_cmd_network()                       # Command parser for network tasks
+# __parse_cmd_resources()                     # Command parser for chyves resources
+# __parse_cmd_snapshot()                      # Command parser for snapshots
+# __root_credentials_required()               # Checks to see if running with root credentials is required.
+# __version()                                 # Show version
+#
+## ../lib/chyves-dataset                     ## Functions dealing with dataset
+# __dataset_install()                         # Install chyves dataset to a pool
+# __dataset_offline()                         # Offline a dataset on a pool
+# __dataset_online()                          # Online a dataset on a pool
+# __dataset_promote()                         # Promote a dataset on a pool
+# __dataset_uninstall()                       # Deinstall chyves dataset to a pool
+# __dataset_upgrade()                         # Upgrade a datasets from version to version
+#
+## ../lib/chyves-guest-console               ## Functions dealing with serial console
+# __console_reset()                           # Kill PIDs for cu sessions based
+# __console_run()                             # Run console
+# __console_tmux()                            # Run console in tmux
+# __console_vnc_custom()                      # Run custom VNC client command
+# __console_vnc_print()                       # Print VNC client setttings
+# __console_vnc_freerdp()                     # Run VNC client with FreeRDP
+# __get_guest_console_pid()                   # Get PID of console
+# __verify_console_not_in_use()               # Check console is in use by PID
+#
+## ../lib/chyves-guest-creation              ## Functions used to create guests in some port or another
+# __clone_guest()                             # Clone a guest
+# __create()                                  # Create guest(s)
+# __generate_new_uuid_guest_use()             # Set new UUID in _UUID_GUEST_USE
+# __generate_zvol_disk_options_string()       # Creates string used to create ZFS volume for disks
+# __get_next_disk_number()                    # Return the next disk for a guest
+# __get_next_serial()                         # Return the next serial interface to use
+# __get_next_tap()                            # Return the next tap interface to use
+# __get_next_vnc_port()                       # Return the next vnc port to use
+# __verify_correct_guest_name_format()        # Verify the guest name meets the naming requirements
+#
+## ../lib/chyves-guests-disks                ## Functions handling disk functions
+# __add_guest_disk()                          # Add a new disk to guest
+# __delete_guest_disk()                       # Delete disk from guest
+# __gvset_disk_clone_origin_for_info_func()   # Set GV indicating clone origin of disk as requested by $1
+# __gvset_first_disk()                        # Set GV for the first disk for a guest
+# __gvset_guest_disk_list()                   # Set GV of list of guests' disks and count
+# __resize_guest_disk()                       # Resize a disk
+#
+## ../lib/chyves-guest-snapshot              ## Functions that deal with chyves snapshots
+# __destroy_guest_snapshot()                  # Destroy guest snapshot(s)
+# __rollback_guest_snapshot()                 # Rollback guest snapshot
+# __snapshot_guest()                          # Create a snapshot for guest
+#
+## ../lib/chyves-guest-start                 ## Functions for starting guests
+# __generate_bhyve_custom_pci_string()        # Generates a bhyve slot string for custom PCI devices
+# __generate_bhyve_disk_string()              # Generates a bhyve slot string for disks
+# __generate_bhyve_net_string()               # Generate bhyve slot string for network devices.
+# __generate_bhyve_slot_string()              # Generates a bhyve PCI slot string from $1
+# __generate_bhyve_vnc_string()               # Generates bhyve slot string for UEFI GOP code
+# __generate_generic_device_map()             # Creates device.map for guest and places in /chyves/guests/$_guest/device.map
+# __generate_grub_bhyve_command()             # Generates grub-bhyve command used to start guest.
+# __start()                                   # All inclusive start function
+# __verify_iommu_capable()                    # Verify I/O MMU (iommu) for guests using PCI passthrough
+#
+## ../lib/chyves-guest-stop                  ## Functions for stopping and recovering VMM resouces.
+# __stop_guest_gracefully()                   # Gracefully stop a guest
+# __stop_guest_loader()                       # Stops a guest's loader
+# __destroy_guest_vmm_resouces()              # Reclaims a guest's VMM resources and also force an unclean shutdown.
+#
+## ../lib/chyves-informational               ## Functions to display information about chyves to the user
+# __list_active_taps()                        # Displays active tap via /dev
+# __list_bridges()                            # List bridges
+# __list_clones()                             # List clones
+# __list_clones_sub()                         # Backend for 'chyves list clones', spiders through each supplied guest name for child clones.
+# __list_defaults()                           # List properties set in .defaults
+# __list_firmware()                           # List Firmware resources. Using "firmware" lists the property firmware rather than the resource
+# __list_global_properties()                  # List properties set in .config
+# __list_iso()                                # List ISO firmware resources.
+# __list_pools()                              # List pools and roles
+# __list_processes()                          # List processes
+# __list_properties()                         # Dynamically lists the guest chyves properties
+# __list_single_property()                    # Lists a property for all active guests. See "chyves list properties" for options
+# __list_snapshots()                          # List snapshots
+# __info()                                    # Display info about all guests.
+#
+## ../lib/chyves-network                     ## Functions for network related tasks
+# __exit_if_tap_locked()                      # Exits if tap is locked by a guest
+# __get_bridge_members_on_system()            # Get bridge members on system
+# __get_bridge_phy_iface_chyves()             # Get outside interface for bridge
+# __get_bridge_list_on_chyves()               # Get a list of bridges on chyves
+# __get_parent_bridge_for_tap_chyves()        # Get a tap's bridge membership as set in .config as a chyves properties
+# __get_iface_list_on_system()                # Get a list of interfaces on system
+# __get_parent_guest_for_tap_chyves()         # Get a tap's guest membership
+# __get_pid_locking_tap()                     # Get PID on tap
+# __get_tap_list_for_bridge_on_chyves()       # Get a list of taps on a bridge in chyves properties
+# __network_attach()                          # Used to associate a bridge with a physical or vlan interface interface
+# __network_add()                             # Part of this function is duplicated in __clone_guest
+# __network_remove()                          # Remove tap/vale interface from guest
+# __network_remove_guest_property_backend()   # Remove tap/vale interface from guest configuration
+# __network_bridge_join()                     # Join a tap device to a bridge membership
+# __network_bridge_migrate()                  # Migrates chyve devices on a bridge to another bridge and sets properties as necessary
+# __network_bridge_unjoin()                   # Unjoin a tap device from a bridge membership
+# __network_add_dev_to_bridge()               # Adds network device to bridge
+# __network_add_phy_to_bridge()               # Adds outside interface to bridge with error handling
+# __network_remove_dev_from_bridge()          # Removes network device from bridge
+# __network_private()                         # Makes a bridge private
+# __verify_iface_on_bridge()                  # Verifies guest has iface configured for it.
+# __verify_iface_on_guest()                   # Verifies guest has iface configured for it.
+# __verify_tap_not_in_use()                   # Verifies tap is not in use on system
+# __verify_vale_system_compat()               # Check if VALE might be possible on system
+# __verify_valid_iface_format()               # Verifies interface is in valid format for type.
+# __verify_valid_system_iface()               # Verifies interface exists on system
+#
+## ../lib/chyves-properties                  ## Functions that deal with chyves properties
+# __get()                                     # Frontend interface to get chyves properties
+# __get_corrected_byte_nomenclature()         # Corrects user input when setting RAM properties and size for .defaults
+# __load_global_parameter_single()            # Load single guest parameter from config file to $_GP_($_var)
+# __load_guest_default_parameter_single()     # Load single guest parameter from config file to $_GP_($_var)
+# __load_guest_default_parameters()           # Loads .defaults parameters to global variables
+# __load_guest_parameter_single()             # Load single guest parameter from config file to $_GP_($_var)
+# __load_guest_parameters()                   # Load guest parameters to global variables
+# __load_one_guest_parameters()               # For use by commands which do not support multi-guest to load parameters ### THIS NEEDS TO BE RENAMED ###
+# __remove_property_in_guest_config_file()    # Remove property in guest config file.
+# __return_property_list()                    # Get all chyves properties that are set on the system
+# __return_property_value_from_config_file()  # Returns property value from config file.
+# __set()                                     # Frontend interface to set chyves properties
+# __verify_user_input_for_properties()        # Middleware for setting properties, verifies user input for properties.
+# __write_property_value_to_config_file()     # Writes config to file.
+#
+## ../lib/chyves-resouces                    ## Functions that primary deal with ISO and Firmware resouces but has some misc guest functions as well.
+# __guest_delete()                            # Delete guest
+# __guest_delete_backend()                    # Backend for deleting guest
+# __guest_upgrade_chyves_guest_version()      # Upgrades guests to the latest 'chyves_guest_version'
+# __resource_delete()                         # Delete ISO and Firmware resources
+# __guest_rename()                            # Rename guest
+# __resource_import()                         # Import ISO and Firmware resources into chyves
+# __resource_rename()                         # Rename ISO or Firmware resources
+#
+## ../lib/chyves-return                       ## Functions that return a value, prone to errors.
+# __return_cpu_section_from_dmesg()            # Pulls CPU section from boot dmesg
+# __return_guest_bhyve_pid()                   # Check bhyve process running status
+# __return_guest_bhyveload_pid()               # Check bhyve process running status
+# __return_guest_dataset_mountpoint()          # Get path for dataset
+# __return_guest_grub_bhyve_pid()              # Check bhyve process running status
+# __return_guest_list()                        # Get a list of guests on system
+# __return_guest_rcboot_priority()             # Displays the boot priority of a guest "YES (xxx)" where xxx is the priority
+# __return_guest_snapshot_last()               # Displays the last snapshot for a guest
+# __return_guest_vmm_allocated()               # Check VMM resource allocation status
+# __return_new_line_delimit_as_comma_string()  # Return a new line delimited string as a comma delimited string
+# __return_new_line_delimit_as_grep_string()   # Return a new line delimited string as a grep delimited string
+# __return_new_line_delimit_as_space_string()  # Return a new line delimited string as a space delimited string
+# __return_one_if_freenas()                    # The web UI references this file to display the version
+# __return_pools_active()                      # Gets pool names from ZFS with flag options for active/inactive
+# __return_pools_all()                         # Gets pool names from ZFS with flag options for active/inactive
+# __return_pools_offline()                     # Gets pool names from ZFS with flag options for active/inactive
+#
+## ../lib/chyves-updates                      ## Function for checking for updates.
+# __check_for_chyves_update()                  # Check for chyves updated
+# __install_from_github()                      # Install latest chyves version from GitHub using specific branch.
+#
+## ../lib/chyves-verify                       ## Function for verify something on the host
+# __verify_all_kernel_modules()                # Verify all modules in $_KERNEL_MODULES
+# __verify_binary_available()                  # Verify that a binary is available
+# __verify_guests()                            # This will be used for general use.
+# __verify_kernel_module_loaded()              # Verify kernel module loaded
+# __verify_number_of_arguments()               # Verifies the number of parameters and exits if met or exceeded
+# __verify_one_guest_supplied()                # Verifies only once guest is supplied
+# __verify_valid_dataset()                     # Verify valid ZFS dataset
+# __verify_valid_pool()                        # Validates if a given pool name exists.
+#
+
+# Stage 1 global variables (Not dependent on functions or primary pool)
+_VERSION=0.2.0                         # Example: v1.6.25 - X.YYYY.ZZZ
+_VERSION_LONG="v0.2.0 2016/09/11"      # Example: v1.6.25 2021/12/31
+_VERSION_INT="00002000"                # Example: 10006025 XYYYYZZZ
+_VERSION_DATASET="0005"
+_VERSION_CHYVES_GUEST="0300"
+_VERSION_BRANCH=master
+_GLOBAL_CONFIG_FILE="$( ls /chyves/*/.config/global.cfg 2>/dev/null )"
+_OS=$( sysctl -n kern.ostype )
+_OS_VERSION_COMMIT=$( sysctl kern.version | tr ' ' '\n' | grep -o -E '^r[0-9]{6,}' | sed -e 's/^r//' )
+_OS_VERSION_DATE=$( sysctl -n kern.osreldate )
+_OS_VERSION_FREENAS=$( [ -e "/etc/version" ] && cat /etc/version )
+_OS_VERSION_REL=$( sysctl -n kern.osrelease )
+_OS_VERSION_REV=$( sysctl -n kern.osrevision )
+_PROJECT_URL=http://chyves.org
+_PROJECT_URL_GIT="https://github.com/chyves/chyves"
+_DATE_YMDMHS=$( date +"%Y%m%d-%H%M.%S" )
+_DATE_YMD=$( date +"%Y%m%d" )
+_DATE_YM=$( date +"%Y%m" )
+_UUID_GENERAL_USE="$(/bin/uuidgen)"
+_UUID_GUEST_USE="$(/bin/uuidgen)"
+_FREEBSD_NET_DRIVERS_GREP_STRING='^cc[0-9][0-9]?$|^ae[0-9][0-9]?$|^age[0-9][0-9]?$|^alc[0-9][0-9]?$|^ale[0-9][0-9]?$|^bce[0-9][0-9]?$|^bfe[0-9][0-9]?$|^bge[0-9][0-9]?$|^bxe[0-9][0-9]?$|^cas[0-9][0-9]?$|^cxgbe[0-9][0-9]?$|^cxgbev[0-9][0-9]?$|^cxl[0-9][0-9]?$|^cxlv[0-9][0-9]?$|^dc[0-9][0-9]?$|^de[0-9][0-9]?$|^em[0-9][0-9]?$|^et[0-9][0-9]?$|^fxp[0-9][0-9]?$|^gem[0-9][0-9]?$|^hme[0-9][0-9]?$|^igb[0-9][0-9]?$|^ix[0-9][0-9]?$|^ixl[0-9][0-9]?$|^ixlv[0-9][0-9]?$|^ixv[0-9][0-9]?$|^jme[0-9][0-9]?$|^lagg[0-9][0-9]?$|^le[0-9][0-9]?$|^lge[0-9][0-9]?$|^msk[0-9][0-9]?$|^nfe[0-9][0-9]?$|^nge[0-9][0-9]?$|^pcn[0-9][0-9]?$|^re[0-9][0-9]?$|^rl[0-9][0-9]?$|^sf[0-9][0-9]?$|^sge[0-9][0-9]?$|^sis[0-9][0-9]?$|^sk[0-9][0-9]?$|^ste[0-9][0-9]?$|^stge[0-9][0-9]?$|^ti[0-9][0-9]?$|^tl[0-9][0-9]?$|^tx[0-9][0-9]?$|^txp[0-9][0-9]?$|^vge[0-9][0-9]?$|^vmx[0-9][0-9]?$|^vr[0-9][0-9]?$|^vx[0-9][0-9]?$|^wb[0-9][0-9]?$|^xl[0-9][0-9]?$'
+_KERNEL_MODULES="$( printf "%s\n%s\n%s\n%s\n%s" "vmm" "nmdm" "if_tap" "bridgestp" "if_bridge" )"
+_NUMBER_OF_ALL_GUESTS="$( zfs list -d 3 -t filesystem -r -o name | grep -c /chyves/guests/ )"
+_GUEST_NAMES_FORBIDDEN_GREP_STRING="^.config$|^.defaults$|^all$|^clone$|^console$|^create$|^dataset$|^defaults$|^delete$|^destroy$|^disk$|^firmware$|^get$|^global$|^guests$|^info$|^iso$|^list$|^network$|^primary$|^reclaim$|^rename$|^reorder$|^reset$|^set$|^snapshot$|^start$|^stop$|^stop$"
+_PCI_SLOT_START=4
+_OFFLIMIT_PCI_SLOT_NUMS_GREP_STRING='^0$|^3$|^31$'
+_UUID_CHECK_GREP_STRING="^[0-9a-fA-F]{4}-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+_LIBRARY_PATH=/usr/local/lib/chyves
+
+##### More global variables set in __preflight_check #####
+PATH=${PATH}:/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin
+
+# This function gets ran before any other.
+__preflight_check() {
+
+	# Load library files
+	__load_library_files
+
+	# FreeNAS
+	__freenas_create_symbolic_link -exit
+
+	# Check to see if more than one pool has the primary role set.
+	if [ "$( echo "$_GLOBAL_CONFIG_FILE" | grep -c "" )" -gt 1 ]; then
+		__fault_detected_exit "More than one primary pool set, fix it!"
+	fi
+
+	# Check to see if there are any pools and report old datasets.
+	grep -hE "^dataset_version=.*" /chyves/*/.config/pool.cfg > /dev/null 2>&1
+	if [ "$?" != 0 ]; then
+		__log 1 "No pools configured."
+	else
+		_OLD_VERSION_DATASETS="$( grep -hE "^dataset_version=.*" /chyves/*/.config/pool.cfg | grep -v "dataset_version=$_VERSION_DATASET" )"
+
+		# Check for out of date datasets when not running setup.
+		if [ -n "$_OLD_VERSION_DATASETS" ]; then
+			if [ "$1" = "dataset" ]; then
+			elif [ "$1" = "list" ] && [ "$2" = "pools" ]; then
+			else
+				__log 1 "Out of date chyves' dataset(s) version found. See below for current version and versions on datasets."
+				__log 1 "Running 'chyves dataset <pool> upgrade' is required before chyves is functional. Running on the primary pool first is recommended."
+				echo ""
+				__version
+				__list_pools
+				__fault_detected_exit "Out of date chyves' dataset(s) version found."
+			fi
+		fi
+	fi
+
+	# CPU feature check
+	# First check to see if EPT/RVI is available then complain if "unrestricted guests" is not found on an Intel CPU.
+	if [ -n "$( __return_cpu_section_from_dmesg | grep 'Features2' | grep 'POPCNT' )" ]; then
+		if [ -n "$( __return_cpu_section_from_dmesg | grep 'Origin' | grep 'GenuineIntel' )" ] && [ -z "$( __return_cpu_section_from_dmesg | grep 'VT-x:' | grep 'UG' )" ]; then
+			__log 1 "This CPU lacks the 'UG' feature of EPT. This is required by bhyve to run to the full extent."
+			__log 1 "Due to this missing CPU feature: a guest is limited to one virtual CPU and starting UEFI guests is disabled."
+			__log 1 "See CPU feature flags below:"
+			__return_cpu_section_from_dmesg
+			# Insert way to disable this warning later on.
+			_CPU_MISSING_UG=1
+		fi
+	else
+		__fault_detected_exit "Your CPU lacks the basic feature to run bhyve. For AMD CPUs this means RVI. For Intel CPUs this means EPT."
+	fi
+
+	# Stage 2 global variables (Dependent on functions or primary pool)
+	__gvset_primary_pool   # Sets $_PRIMARY_POOL
+	_GLOBAL_CONFIG_FILE="/chyves/$_PRIMARY_POOL/.config/global.cfg"
+	if [ -z "$_PRIMARY_POOL" ]; then
+		__log 1 "Run setup to install chyves dataset on a pool."
+		[ "$1" != "dataset" ] && __fault_detected_exit "No seriously, run 'chyves dataset <ZFS-pool-name> install'"
+	else
+
+		# Load all global parameters in global config file to global varibles in the _UPPER_UPPER_UPPER format.
+		for _var in `cat $_GLOBAL_CONFIG_FILE | cut -d'=' -f1`
+		do
+			__load_global_parameter_single "$_var"
+		done
+
+		_DEFAULT_CONFIG_FILE="/chyves/$_PRIMARY_POOL/guests/.defaults"
+		_CHECK_FOR_UPDATES_URL="$_PROJECT_URL_GIT/raw/${_VERSION_BRANCH}/sbin/chyves"
+		_GUEST_NAMES_ACTIVE="$( __return_new_line_delimit_as_comma_string $( __return_guest_list ) )"
+		_GUEST_NAMES_ALL_GREP_STRING="$( __return_new_line_delimit_as_grep_string $( __return_guest_list ) )"
+	fi
+
+	if [ "$_TAP_UP_BY_DEFAULT" = "yes" ]; then
+		__verify_kernel_module_loaded if_tap -l
+		sysctl net.link.tap.up_on_open=1 > /dev/null 2>&1
+	fi
+}
+
+# Loads the library file(s) and exits if any are missing.
+__load_library_files() {
+	local _library_to_load="$1"
+	local _common_library=""
+
+	if [ -z "$_library_to_load" ]; then
+		local _library_to_load="$_common_library"
+	fi
+
+	for _lib_file in basics guest-console guest-creation guest-disk guest-snapshot guest-start guest-stop informational network properties resources return updates verify
+	do
+		__log 4 "Loading library file: $_lib_file"
+		if [ -e "$_LIBRARY_PATH/chyves-$_lib_file" ]; then
+			. "$_LIBRARY_PATH/chyves-$_lib_file"
+			__log 4 "Done loading $_lib_file."
+		else
+			__fault_detected_exit "\n\n\nMissing chyves library file 'chyves-$_lib_file' from '$_LIBRARY_PATH'\n\n\n"
+		fi
+	done
+}
+
+# Function used to continue with a message.
+__fault_detected_warning_continue() {
+	__log 1 "[WARNING] $1" -e
+	continue
+}
+
+# Function used to exit with a message.
+__fault_detected_exit() {
+	local message="$1"
+	__log 1 "Critical error detected. Exiting for following reason:"
+	__log 1 "$1" -e
+	exit 1
+}
+
+# Function used to break with a message.
+__fault_detected_warning_break() {
+	__log 1 "[WARNING] $2" -e
+	break $1
+}
+
+# Logs to file or screen.
+__log() {
+	local _echo_option _full_timestamp _guest_log_path _host_log_path _message _output_level
+	local _output_level="$1"
+	local _message="$2"
+	local _echo_option="$3"
+	local _full_timestamp="$( date -u +%FT%T%z )"    # ISO 8601 format
+
+	# Handling for pre-chyves setup on pool
+	[ -z "$_STDOUT_LEVEL" ] && _STDOUT_LEVEL=2
+	[ -z "$_LOG_MODE" ] && _LOG_MODE=host
+
+	# Print output to screen
+	if [ "$_output_level" -le "$_STDOUT_LEVEL" ] && [ "$_STDOUT_LEVEL" -ne 0 ]; then
+
+		if [ "$_LAST_log_echo_option" = "-n" ] || [ "$_STDOUT_LEVEL" -lt 3 ]; then
+			echo $_echo_option "$_message"
+		else
+			echo $_echo_option "[$_output_level] $_message"
+		fi
+
+		_LAST_log_echo_option="$_echo_option"
+	fi
+
+	[ -z "$_PRIMARY_POOL" ] && return
+
+	# Log to message to file(s)
+	if [ "$_LOG_TO_FILE" = "yes" ]; then
+
+		# If _GUEST_name is set, then set the variable to record to the guest path.
+		if [ -n "$_GUEST_name" ]; then
+			if [ "$_LOG_MODE" = "guest" ] || [ "$_LOG_MODE" = "dual" ]; then
+				if [ -e "$_GUEST_mountpoint/logs" ]; then
+					local _guest_log_path="$_GUEST_mountpoint/logs/$_DATE_YM.log"
+				fi
+			fi
+		fi
+
+		# If host or dual mode is set, then set varible to record
+		if [ "$_LOG_MODE" = "host" ] || [ "$_LOG_MODE" = "dual" ]; then
+			if [ -e "/chyves/$_PRIMARY_POOL/logs" ] ; then
+				local _host_log_path="/chyves/$_PRIMARY_POOL/logs/$_DATE_YM.log"
+			fi
+		fi
+
+		echo "$_full_timestamp - [$_output_level] - $_message" | tee -a $_host_log_path $_guest_log_path > /dev/null 2>&1
+
+	fi
+}
+
+__preflight_check "$1" "$2"
+
+# Check GitHub for updates
+[ -n "$_PRIMARY_POOL" ] && __check_for_chyves_update
+
+__parse_cmd_ingress "$@"

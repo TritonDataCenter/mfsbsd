@@ -1,0 +1,386 @@
+#!/bin/sh
+
+# Copyright (c) 2015, pr1ntf (Trent Thompson) All rights reserved.
+# Copyright (c) 2016, Justin D Holcomb All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Clone a guest
+__clone_guest() {
+	local _clone_list="$1"
+	local _flag="$2"                  # Indicates method of cloning -ce|-cu|-ie|iu
+	local _dst_pool="$3"
+	local _src_pool="$_GUEST_pool"   # For clarity
+	local _clone_msg="Creating dependent clones ($_clone_list) from $_GUEST_name."
+	local _independent_msg="Creating independent clones ($_clone_list) from $_GUEST_name."
+	local _exact_properties_msg="Clones will share all properties with $_GUEST_name."
+	local _unique_properties_msg="Clones will have unique properties, see man page for details."
+	__load_guest_default_parameters
+
+	# Use global clone method if null
+	[ -z "$_flag" ] && local _flag=$_DEFAULT_CLONE_FLAG
+
+	# Verify correct flag is used and coach the user
+	if [ "$_flag" = "-ce" ]; then
+		__log 1 "$_clone_msg"
+		__log 1 "$_exact_properties_msg"
+	elif [ "$_flag" = "-cu" ]; then
+		__log 1 "$_clone_msg"
+		__log 1 "$_unique_properties_msg"
+	elif [ "$_flag" = "-ie" ]; then
+		__log 1 "$_independent_msg"
+		__log 1 "$_exact_properties_msg"
+	elif [ "$_flag" = "-iu" ]; then
+		__log 1 "$_independent_msg"
+		__log 1 "$_unique_properties_msg"
+	else
+		__fault_detected_exit "Invalid flag used '$_flag'. See 'man chyves' for correct flags and details."
+	fi
+
+	# Handling if guest is a template but unique properties are desired.
+	if [ "$_flag" = "-cu" ] || [ "$_flag" = "-iu" ]; then
+		if [ "$_GP_template" = "yes" ]; then
+			__log 1 "$_GUEST_name is set as a template and unique properties are desired. Temporarily setting template mode to 'no' but will return to 'yes' after cloning has finished."
+			local _guest_was_a_template=1
+			__set $_GUEST_name set template=no
+		fi
+	fi
+
+	# Clones must always be on the same pool.
+	if [ "$_flag" = "-ce" ] || [ "$_flag" = "-cu" ]; then
+		[ "$_dst_pool" != "$_src_pool" ] && __log 1 "Clones are dependent on their parents and must be on the same pool, this is due to how ZFS clone work."
+		local _dst_pool=$_src_pool
+
+	# See if destination pool is declared.
+	elif [ -z "$_dst_pool" ]; then
+		local _dst_pool=$_src_pool
+	fi
+
+	__log 2 "Taking snapshot of $_GUEST_name on $_src_pool named @chyves-clone-process-$_UUID_GENERAL_USE"
+	zfs snapshot -r $_src_pool/chyves/guests/$_GUEST_name@chyves-clone-process-$_UUID_GENERAL_USE
+
+	# Multi-guest support.
+	# Eg.: chyves goldenVM clone devteam1,devteam2,devteam3
+	for _cname in `echo "$_clone_list" | tr ',' ' '`
+	do
+		__log 1 "Creating clone '$_cname' from '$_GUEST_name'"
+
+		# Create a true ZFS clone of the guest's datasets
+		if [ "$_flag" = "-ce" ] || [ "$_flag" = "-cu" ]; then
+
+			__log 2 "Creating guest dataset"
+			zfs create $_dst_pool/chyves/guests/$_cname
+
+			__log 2 "Creating log dataset with compression turned on."
+			zfs create -o compression=on $_dst_pool/chyves/guests/$_cname/logs
+
+			__log 2 "Copying guest parameters from $_GUEST_name"
+			zfs send -R $_src_pool/chyves/guests/$_GUEST_name/.config@chyves-clone-process-$_UUID_GENERAL_USE | zfs recv $_dst_pool/chyves/guests/$_cname/.config
+
+			__log 2 "Creating ZFS clones of each disk dataset..."
+			for _dataset in `zfs list -H -r -t volume,filesystem -o name $_src_pool/chyves/guests/$_GUEST_name | grep -v -E '/logs$|/.config$' | tail +2 | tr '\n' ' '`
+			do
+				local _dataset_suffix="$( echo "$_dataset" | cut -d '/' -f 5 )"
+				__log 2 "Cloning: $_dataset@chyves-clone-process-$_UUID_GENERAL_USE"
+				__log 2 "     to: $_dst_pool/chyves/guests/$_cname/$_dataset_suffix"
+				zfs clone $_dataset@chyves-clone-process-$_UUID_GENERAL_USE $_dst_pool/chyves/guests/$_cname/$_dataset_suffix
+			done
+
+		# Create an independent clone
+		elif [ "$_flag" = "-ie" ] || [ "$_flag" = "-iu" ]; then
+
+			echo "Cloning $_GUEST_name to $_cname"
+			echo "Verifing $_cname is unused."
+			__verify_correct_guest_name_format "$_cname"    # Exits if name in use.
+
+			echo "Using zfs send to send $_GUEST_name to $_cname"
+			zfs send -R $_src_pool/chyves/guests/$_GUEST_name@chyves-clone-process-$_UUID_GENERAL_USE | zfs recv $_dst_pool/chyves/guests/$_cname
+
+			echo "Setting creation stamp on $_cname..."
+			local _creation_stamp="Cloned from $_GUEST_name on $( date ) by chyves $_VERSION_LONG using __clone_guest()"
+			__write_property_value_to_config_file "manual" "creation" "$_creation_stamp" "/chyves/$_dst_pool/guests/$_cname/.config/.cfg"
+		fi
+
+		# Create unique guest properties when -*u is used
+		if [ "$_flag" = "-cu" ] || [ "$_flag" = "-iu" ]; then
+			echo "Setting new properties as part of replication..."
+
+			# Erase network configuration as we will be copying the parent's configuration
+			__write_property_value_to_config_file "manual" "net_ifaces" "-" "/chyves/$_dst_pool/guests/$_cname/.config/.cfg"
+
+			# Recreate network design from parent
+			__log 2 "Configuring $_cname network to mimic the design of $_GUEST_name..."
+			for _interface in `echo $_GP_net_ifaces | tr ',' ' '`
+			do
+				__verify_valid_iface_format "$_interface"
+
+				# Get net config for guest
+				local _guest_net_config="$( __return_property_value_from_config_file "manual" "net_ifaces" "/chyves/$_dst_pool/guests/$_cname/.config/.cfg" )"
+
+				__log 2 "Mimicking $_interface interface for $_cname."
+				if [ "$_IFACE_type" = "vale" ]; then
+
+					# Remove port config from vale interface
+					local _new_interface="$( echo $_interface | cut -d':' -f1 )"
+
+				elif [ "$_IFACE_type" = "tap" ]; then
+
+					# NETWORK_DESIGN_MODE handling
+					if [ "$_NETWORK_DESIGN_MODE" = "auto" ]; then
+						__log 2 "Getting bridge that $_interface belongs to..." -n
+						__get_parent_bridge_for_tap_chyves $_interface
+						__log 2 "$_PARENT_bridge_for_tap_chyves."
+						__log 2 "Getting next tap interface..." -n
+						__get_next_tap
+						__log 2 "$_NEXT_tap."
+						local _new_interface="$_NEXT_tap"
+						__log 2 "Joining $_new_interface to $_PARENT_bridge_for_tap_chyves... " -n
+						__network_bridge_join "$_PARENT_bridge_for_tap_chyves" "$_new_interface"
+						__log 2 "done."
+					elif [ "$_NETWORK_DESIGN_MODE" = "system" ]; then
+						__log 2 "Getting next tap interface..." -n
+						__get_next_tap
+						__log 2 "$_NEXT_tap."
+						local _new_interface="$_NEXT_tap"
+					fi
+				fi
+
+				# Set variable for new net configuration
+				if [ "$_guest_net_config" = "-" ] || [ "$_guest_net_config" = "" ]; then
+					local _guest_net_config="$_new_interface"
+				else
+					local _guest_net_config="$_guest_net_config,$_new_interface"
+				fi
+
+				__write_property_value_to_config_file "manual" "net_ifaces" "$_guest_net_config" "/chyves/$_dst_pool/guests/$_cname/.config/.cfg"
+			done
+			__log 2 "Done recreating nework design for $_cname from $_GUEST_name's design."
+
+			__get_next_serial
+			__log 2 "Assigning next available unused console interface... $_NEXT_serial"
+			__write_property_value_to_config_file "manual" "serial" "$_NEXT_serial" "/chyves/$_dst_pool/guests/$_cname/.config/.cfg"
+
+			# Set next available UEFI VNC Port number if source guest has it set.
+			if [ -n "$_GP_uefi_vnc_port" ]; then
+				__get_next_vnc_port
+				__log 2 "Assigning next available unused 'uefi_vnc_port'... $_NEXT_vnc_port"
+				__write_property_value_to_config_file "manual" "uefi_vnc_port" "$_NEXT_vnc_port" "/chyves/$_dst_pool/guests/$_cname/.config/.cfg"
+			fi
+
+			__log 2 "Generating new UUID... " -n
+			__generate_new_uuid_guest_use
+			__log 2 "$_UUID_GUEST_USE"
+			__write_property_value_to_config_file "manual" "uuid" "$_UUID_GUEST_USE" "/chyves/$_dst_pool/guests/$_cname/.config/.cfg"
+		fi
+		__log 1 "Completed clone of $_cname from $_GUEST_name."
+		echo "" # Create visual space for next multi-guest.
+	done
+
+	# Deleting snapshot for independent clone
+	if [ "$_flag" = "-ie" ] || [ "$_flag" = "-iu" ]; then
+		__log 1 "Deleting snapshot on $_src_pool"
+		if [ -z "$_src_pool" ]; then
+			__fault_detected_exit "Something went wrong, \$_src_pool variable is empty. Aborting before running zfs destroy command. Please report to the chyves developers."
+		else
+			zfs destroy -rR $_src_pool/chyves/guests/$_GUEST_name@chyves-clone-process-$_UUID_GENERAL_USE
+			if [ "$?" = 0 ]; then
+				echo "Successfully deleted snapshot for clone."
+			else
+				echo "Unsuccessfully deleted snapshot on $_src_pool"
+				echo "To delete, run this manually: zfs destroy -rR $_src_pool/chyves/guests/$_GUEST_name@chyves-clone-process-$_UUID_GENERAL_USE"
+			fi
+		fi
+	fi
+
+	# Needs to be set for final message, and templates will change the value of $_GUEST_name.
+	local _original_guest="$_GUEST_name"
+
+	# Final handling if guest was a templat to set back as a template.
+	if [ "$_flag" = "-cu" ] || [ "$_flag" = "-iu" ]; then
+		if [ "$_guest_was_a_template" ]; then
+		__log 1 "$_GUEST_name was originally a template, setting '${_GUEST_name},$_clone_list' back as a template. Run 'chyves $_clone_list set template=no' to turn off template on the clones."
+		__set "${_GUEST_name},$_clone_list" set template=yes
+		fi
+	fi
+
+	__log 1 "Successfully cloned $_original_guest to $_clone_list."
+}
+
+# Create guest(s)
+__create() {
+	local _disk_size _guest_list _pool
+	local _guest_list="$1"
+	local _disk_size="$2"
+	_GUEST_pool="$3"
+	__load_guest_default_parameters
+	__generate_zvol_disk_options_string
+
+	# If size not declared in command line, use .default's
+	[ -z $_disk_size ] && local _disk_size="$_GDP_size"
+
+	# If pool not set use primary
+	[ -z "$_GUEST_pool" ] && _GUEST_pool="$_PRIMARY_POOL"
+
+	# Multi-guest support.
+	# Eg.: chyves create guest1,guest2,guest3 8G ssd-pool
+	for _guest in `echo "$_guest_list" | tr ',' ' '`
+	do
+		__get_next_tap
+		__get_next_serial
+		__generate_new_uuid_guest_use
+		_GUEST_name="$_guest"
+
+		__log 1 "Creating $_GUEST_name..."
+		__log 2 "Creating dataset on $_GUEST_pool"
+		zfs create $_GUEST_pool/chyves/guests/$_GUEST_name
+		zfs create -o snapdir=visible $_GUEST_pool/chyves/guests/$_GUEST_name/.config
+		_GUEST_mountpoint="$( __return_guest_dataset_mountpoint )"
+		_GUEST_config_file="$_GUEST_mountpoint/.config/.cfg"
+		touch $_GUEST_config_file
+
+		__log 2 "Creating log dataset with compression turned on."
+		zfs create -o compression=on $_GUEST_pool/chyves/guests/$_GUEST_name/logs
+		__log 2 "Creating raw image dataset: $_GUEST_pool/chyves/guests/$_GUEST_name/img"
+		zfs create $_GUEST_pool/chyves/guests/$_GUEST_name/img
+		__log 2 "Creating $_disk_size disk0 with options: $_ZVOL_disk_options_string"
+		zfs create -V $_disk_size $_ZVOL_disk_options_string $_GUEST_pool/chyves/guests/$_GUEST_name/disk0
+		__log 2 "Setting guest properties:"
+		__write_property_value_to_config_file "guest" "bargs"                      "$_GDP_bargs"
+		__write_property_value_to_config_file "guest" "bhyveload_flags"            "$_GDP_bhyveload_flags"
+		__write_property_value_to_config_file "guest" "bhyve_disk_type"            "$_GDP_bhyve_disk_type"
+		__write_property_value_to_config_file "guest" "bhyve_net_type"             "$_GDP_bhyve_net_type"
+		__write_property_value_to_config_file "guest" "chyves_guest_version"       "$_VERSION_CHYVES_GUEST"
+		__write_property_value_to_config_file "guest" "cpu"                        "$_GDP_cpu"
+		__write_property_value_to_config_file "guest" "creation"                   "Created on $( date ) by chyves $_VERSION_LONG using __create()"
+		__write_property_value_to_config_file "guest" "description"                "-"
+		__write_property_value_to_config_file "guest" "loader"                     "$_GDP_loader"
+		__write_property_value_to_config_file "guest" "net_ifaces"                 "$_NEXT_tap"
+		__write_property_value_to_config_file "guest" "notes"                      "-"
+		__write_property_value_to_config_file "guest" "os"                         "$_GDP_os"
+		__write_property_value_to_config_file "guest" "ram"                        "$_GDP_ram"
+		__write_property_value_to_config_file "guest" "rcboot"                     "$_GDP_rcboot"
+		__write_property_value_to_config_file "guest" "revert_to_snapshot"         "$_GDP_revert_to_snapshot"
+		__write_property_value_to_config_file "guest" "revert_to_snapshot_method"  "$_GDP_revert_to_snapshot_method"
+		__write_property_value_to_config_file "guest" "serial"                     "$_NEXT_serial"
+		__write_property_value_to_config_file "guest" "template"                   "$_GDP_template"
+		__write_property_value_to_config_file "guest" "uuid"                       "$_UUID_GUEST_USE"
+
+		# NETWORK_DESIGN_MODE handling
+		if [ "$_NETWORK_DESIGN_MODE" = "auto" ]; then
+			__log 2 "Adding $_NEXT_tap to $_GDP_bridge"
+			__network_bridge_join "$_GDP_bridge" "$_NEXT_tap"
+		fi
+
+		__log 1 "$_GUEST_name created."
+		echo ""  # Create visual space for next multi-guest.
+	done
+}
+
+# Set new UUID in _UUID_GUEST_USE
+__generate_new_uuid_guest_use() {
+	_UUID_GUEST_USE="$(/bin/uuidgen)"
+}
+
+# Creates string used to create ZFS volume for disks
+__generate_zvol_disk_options_string() {
+	[ "$_GDP_parameters_loaded" != 1 ] && __load_guest_default_parameters
+
+	# Compile a variable string to be used in the ZFS volume creation
+	[ "${_GDP_disk_volmode}" != "inherit" ] && local _disk_options="-o volmode=$_GDP_disk_volmode"
+	[ "${_GDP_disk_volblocksize}" != "inherit" ] && local _disk_options="$_disk_options -o volblocksize=$_GDP_disk_volblocksize"
+	[ "${_GDP_disk_dedup}" != "inherit" ] && local _disk_options="$_disk_options -o dedup=$_GDP_disk_dedup"
+	[ "${_GDP_disk_compression}" != "inherit" ] && local _disk_options="$_disk_options -o compression=$_GDP_disk_compression"
+	[ "${_GDP_disk_primarycache}" != "inherit" ] && local _disk_options="$_disk_options -o primarycache=$_GDP_disk_primarycache"
+	[ "${_GDP_disk_secondarycache}" != "inherit" ] && local _disk_options="$_disk_options -o secondarycache=$_GDP_disk_secondarycache"
+
+	_ZVOL_disk_options_string="$_disk_options"
+}
+
+# Return the next disk for a guest
+__get_next_disk_number() {
+	local _disk_last="$( zfs list -H -t volume -r -o name $_GUEST_pool/chyves/guests/$_GUEST_name | cut -d'/' -f5 | sed 's/disk//g' | sort -V | tail -n1 )"
+	if [ -z "$_disk_last" ]; then
+		local _disk_last=0
+	else
+		local _disk_last="$( expr $_disk_last + 1 )"
+	fi
+	_NEXT_disk_number="$_disk_last"
+}
+
+# Return the next serial interface to use
+__get_next_serial() {
+
+	if [ "$_NUMBER_OF_ALL_GUESTS" = 0 ]; then
+		local _conlast="$_CONSOLE_START_OFFSET"
+	else
+		local _conlast="$( grep -hE "^serial=" /chyves/*/guests/*/.config/.cfg | cut -d'=' -f2 | sort -V | tail -n1 | cut -c 5- )"
+		local _conlast="$( expr $_conlast + 1 )"
+	fi
+	_NEXT_serial="nmdm$_conlast"
+}
+
+# Return the next tap interface to use
+__get_next_tap() {
+
+	if [ "$_NUMBER_OF_ALL_GUESTS" = 0 ]; then
+		local _tap_num="$_TAP_START_OFFSET"
+	else
+		local _taplast="$( grep -hE "^net_ifaces=" /chyves/*/guests/*/.config/.cfg | cut -d'=' -f2- | tr ',' '\n' | grep tap | sort -V | tail -n1 | cut -c 4- )"
+		local _tap_num="$( expr $_taplast + 1 )"
+	fi
+	_NEXT_tap="tap$_tap_num"
+}
+
+# Return the next vnc port to use
+__get_next_vnc_port() {
+
+	if [ "$_NUMBER_OF_ALL_GUESTS" = 0 ]; then
+		local _vnc_port_last="$_UEFI_VNC_PORT_START_OFFSET"
+	else
+		local _vnc_port_last="$( grep -hE "^uefi_vnc_port=" /chyves/*/guests/*/.config/.cfg | cut -d'=' -f2 | sort -V | tail -n1 )"
+		[ -z "$_vnc_port_last" ] && local _vnc_port_last="$( expr $_UEFI_VNC_PORT_START_OFFSET - 1 )"
+		local _vnc_port_last="$( expr $_vnc_port_last + 1 )"
+	fi
+	_NEXT_vnc_port="$_vnc_port_last"
+}
+
+# Verify the guest name meets the naming requirements
+__verify_correct_guest_name_format() {
+	local _guest_list="$1"
+
+	[ "$( echo "$_guest_list" | tr ',' '\n' | sort -k1 | uniq -c | sort -r -k1 | head -n1 | awk '{ printf $1; }' )" -gt 1 ] && __fault_detected_exit "Guest name repeated in command."
+
+	for _guest_to_check in `echo "$_guest_list" | tr ',' ' '`
+	do
+		# Check if guest name is forbidden
+		[ -n  "$( echo "$_guest_to_check" | grep -E "$_GUEST_NAMES_FORBIDDEN_GREP_STRING" )" ] && __fault_detected_exit "\"$_guest_to_check\" name is forbidden."
+
+		# Check for valid guest name and length
+		[ -z "$( echo "$_guest_to_check" | grep -E "^[a-zA-Z0-9_.-]{1,27}$" )" ] && __fault_detected_exit "Unsuitable name: '$_guest_to_check', must be alphanumeric between 1 and 27 characters and optionally can contain dashes '-', underscores '_', and or periods '.'."
+
+		# Check if guest name in use on active pool.
+		if [ -n "$( echo "$_guest_to_check" | grep -E "$_GUEST_NAMES_ALL_GREP_STRING" )" ]; then
+			[ "$_DEV_MODE" != "off" ] && echo "Guest names all grep string: $_GUEST_NAMES_ALL_GREP_STRING"
+			__fault_detected_exit "\"$_guest_to_check\" name already in use on system within active pools and guests."
+		fi
+	done
+}

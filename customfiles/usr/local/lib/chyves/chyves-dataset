@@ -1,0 +1,211 @@
+#!/bin/sh
+
+# Copyright (c) 2015, pr1ntf (Trent Thompson) All rights reserved.
+# Copyright (c) 2016, Justin D Holcomb All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Install chyves dataset to a pool
+__dataset_install() {
+	local _pool="$1"
+	local _creation_stamp="Dataset originally created on $( date ) by chyves $_VERSION_LONG using dataset version $_VERSION_DATASET"
+	echo "Setting up chyves on $_pool..."
+	zfs create -o mountpoint=/chyves/$_pool $_pool/chyves
+	zfs create $_pool/chyves/.config
+	__freenas_create_symbolic_link   # This will only execute an action if on FreeNAS system.
+	touch /chyves/$_pool/.config/pool.cfg
+	__write_property_value_to_config_file "manual" "creation"        "$_creation_stamp" "/chyves/$_pool/.config/pool.cfg"
+	__write_property_value_to_config_file "manual" "dataset_version" "$_VERSION_DATASET" "/chyves/$_pool/.config/pool.cfg"
+	zfs create $_pool/chyves/guests
+
+	# A chyves pool is already setup, so setup as secondary pool.
+	if [ -n "$_PRIMARY_POOL" ]; then
+		echo "Setting pool up in secondary dataset role..."
+		__write_property_value_to_config_file "manual" "dataset_role" "secondary" "/chyves/$_pool/.config/pool.cfg"
+
+	# chyves is not set up yet, setup primary pool.
+	else
+		_PRIMARY_POOL=$_pool
+		_RESTRICT_NEW_PROPERTY_NAMES="master-override"
+		_GLOBAL_CONFIG_FILE="/chyves/$_PRIMARY_POOL/.config/global.cfg"
+		_DEFAULT_CONFIG_FILE="/chyves/$_PRIMARY_POOL/guests/.defaults"
+		__write_property_value_to_config_file "manual" "dataset_role" "primary" "/chyves/$_PRIMARY_POOL/.config/pool.cfg"
+		touch "$_GLOBAL_CONFIG_FILE"
+		touch "$_DEFAULT_CONFIG_FILE"
+		echo "Creating compressed log dataset"
+		zfs create -o compression=on $_PRIMARY_POOL/chyves/logs
+		_LOG_TO_FILE="YES"
+		__log 2 "Creating ISO and Firmware resource datasets..."
+		zfs create $_PRIMARY_POOL/chyves/Firmware
+		zfs create $_PRIMARY_POOL/chyves/ISO
+
+		# Hosts on FreeBSD 10.3 or above need to use the "-S" bhyve wire memory flag otherwise fun stuff happens at memory starvation.
+		if [ "$_OS_VERSION_DATE" -lt "1003000" ]; then
+			local _bhyve_args="-A -H -P"
+		else
+			local _bhyve_args="-A -H -P -S"
+		fi
+
+		__log 2 "Creating guest defaults dataset and properties..."
+		__write_property_value_to_config_file "defaults" "bargs"                                "$_bhyve_args"
+		__write_property_value_to_config_file "defaults" "bhyveload_flags"                      ""
+		__write_property_value_to_config_file "defaults" "bhyve_disk_type"                      "ahci-hd"
+		__write_property_value_to_config_file "defaults" "bhyve_net_type"                       "virtio-net"
+		__write_property_value_to_config_file "defaults" "bridge"                               "bridge0"
+		__write_property_value_to_config_file "defaults" "cpu"                                  "1"
+		__write_property_value_to_config_file "defaults" "disk_volmode"                         "dev"
+		__write_property_value_to_config_file "defaults" "disk_volblocksize"                    "128"
+		__write_property_value_to_config_file "defaults" "disk_dedup"                           "inherit"
+		__write_property_value_to_config_file "defaults" "disk_compression"                     "inherit"
+		__write_property_value_to_config_file "defaults" "disk_primarycache"                    "inherit"
+		__write_property_value_to_config_file "defaults" "disk_secondarycache"                  "inherit"
+		__write_property_value_to_config_file "defaults" "loader"                               "bhyveload"
+		__write_property_value_to_config_file "defaults" "os"                                   "default"
+		__write_property_value_to_config_file "defaults" "ram"                                  "256M"
+		__write_property_value_to_config_file "defaults" "rcboot"                               "0"
+		__write_property_value_to_config_file "defaults" "revert_to_snapshot"                   ""
+		__write_property_value_to_config_file "defaults" "revert_to_snapshot_method"            "off"
+		__write_property_value_to_config_file "defaults" "size"                                 "8G"
+		__write_property_value_to_config_file "defaults" "template"                             "no"
+		__write_property_value_to_config_file "defaults" "uefi_console_output"                  "serial"
+		__write_property_value_to_config_file "defaults" "uefi_firmware"                        "-"
+		__write_property_value_to_config_file "defaults" "uefi_vnc_client"                      "print"
+		__write_property_value_to_config_file "defaults" "uefi_vnc_ip"                          "0.0.0.0"
+		__write_property_value_to_config_file "defaults" "uefi_vnc_mouse_type"                  "ps2"
+		__write_property_value_to_config_file "defaults" "uefi_vnc_pause_until_client_connect"  "no"
+		__write_property_value_to_config_file "defaults" "uefi_vnc_res"                         "800x600"
+
+		__log 2 "Setting up global properties on primary pool..."
+		__write_property_value_to_config_file "global" "auto_load_kernel_mods"                "yes"
+		__write_property_value_to_config_file "global" "check_for_updates"                    "weekly"
+		__write_property_value_to_config_file "global" "check_for_updates_timeout_seconds"    "2"
+		__write_property_value_to_config_file "global" "check_for_updates_last_check"         "$_DATE_YMD"
+		__write_property_value_to_config_file "global" "check_for_updates_last_check_status"  "0"
+		__write_property_value_to_config_file "global" "check_for_updates_unique_id"          "$_UUID_GENERAL_USE"
+		__write_property_value_to_config_file "global" "console_start_offset"                 "50"
+		__write_property_value_to_config_file "global" "consolidate_bhyve_pci_devices"        "no"
+		__write_property_value_to_config_file "global" "default_clone_flag"                   "-iu"
+		__write_property_value_to_config_file "global" "default_info_flags"                   "-h"
+		__write_property_value_to_config_file "global" "default_list_flags"                   "-skdp"
+		__write_property_value_to_config_file "global" "dev_mode"                             "off"
+		__write_property_value_to_config_file "global" "eject_iso_on_n_reboot"                "1"
+		__write_property_value_to_config_file "global" "network_design_mode"                  "auto"
+		__write_property_value_to_config_file "global" "log_mode"                             "dual"
+		__write_property_value_to_config_file "global" "log_to_file"                          "yes"
+		__write_property_value_to_config_file "global" "restrict_new_property_names"          "on"
+		__write_property_value_to_config_file "global" "stdout_level"                         "2"
+		__write_property_value_to_config_file "global" "tap_start_offset"                     "50"
+		__write_property_value_to_config_file "global" "tap_up_by_default"                    "yes"
+		__write_property_value_to_config_file "global" "vlan_iface_base_name"                 "vlan"
+		__write_property_value_to_config_file "global" "uefi_vnc_port_start_offset"           "5900"
+
+		__log 2 "Saving global settings as a snapshot"
+		zfs snapshot $_PRIMARY_POOL/chyves/.config@${_DATE_YMD}-chyves-install-inital-settings-version-${_VERSION}
+
+		__log 2 "Creating null.iso for UEFI use..."
+		touch /tmp/null.iso
+		if [ -e /tmp/null.iso ]; then
+			__log 2 "Importing null.iso into ISO resources..."
+			__resource_import iso /tmp/null.iso
+		fi
+
+		__log 2 "Done setting up primary pool: $_pool"
+	fi
+}
+
+# Incrementally upgrade a datasets from version to version
+__dataset_upgrade() {
+	local _pool="$1"
+
+	__dataset_upgrade_lset_version() {
+		_DATASET_pool_version_int="$( __return_property_value_from_config_file "manual" "dataset_version" "/chyves/$_pool/.config/pool.cfg" )"
+	}
+
+	# Seed value
+	__dataset_upgrade_lset_version
+
+	# Prepare to add new paramaters
+	_RESTRICT_NEW_PROPERTY_NAMES=master-override
+
+	# Added defaults bhyve_net_type
+	if [ "$_DATASET_pool_version_int" = "0001" ]; then
+		__log 1 "Upgrading dataset to version 0002"
+		[ "$_PRIMARY_POOL" = "$_pool" ] && __write_property_value_to_config_file "defaults" "bhyve_net_type" "virtio-net"
+		__load_guest_default_parameters
+		__write_property_value_to_config_file "manual" "dataset_version" "0002" "/chyves/$_pool/.config/pool.cfg"
+		__dataset_upgrade_lset_version
+	fi
+
+	# Updated to include new 'revert_to_snapshot' and 'revert_to_snapshot_method' default properties. Also update default 'bargs' to include '-S' flag on FreeBSD 10.3+ hosts.
+	if [ "$_DATASET_pool_version_int" = "0002" ]; then
+		__log 1 "Upgrading dataset to version 0003"
+
+		# Hosts on FreeBSD 10.3 or are recommended to use the "-S" bhyve wire memory flag otherwise fun stuff happens at memory starvation.
+		if [ "$_OS_VERSION_DATE" -ge "1003000" ]; then
+			__load_guest_default_parameters
+
+			# Check if the initial default value is the same, otherwise do not change.
+			if [ "$_GDP_bargs" = "-A -H -P" ] && [ "$_PRIMARY_POOL" = "$_pool" ]; then
+				__log 1 "Updating default 'bargs' value. "
+				__write_property_value_to_config_file "defaults" "bargs" "-A -H -P -S"
+			else
+				__log 1 "It is recommended to include the '-S' bhyve arguement in the 'bargs' property for guests and defaults."
+			fi
+		fi
+
+		[ "$_PRIMARY_POOL" = "$_pool" ] && __write_property_value_to_config_file "defaults" "revert_to_snapshot" ""
+		[ "$_PRIMARY_POOL" = "$_pool" ] && __write_property_value_to_config_file "defaults" "revert_to_snapshot_method" "off"
+		__write_property_value_to_config_file "manual" "dataset_version" "0003" "/chyves/$_pool/.config/pool.cfg"
+		__dataset_upgrade_lset_version
+	fi
+
+	# Updated to include new 'eject_iso_on_n_reboot' global properties.
+	if [ "$_DATASET_pool_version_int" = "0003" ]; then
+		__log 1 "Upgrading dataset to version 0004"
+		[ "$_PRIMARY_POOL" = "$_pool" ] && __write_property_value_to_config_file "global" "eject_iso_on_n_reboot" "1"
+		__write_property_value_to_config_file "manual" "dataset_version" "0004" "/chyves/$_pool/.config/pool.cfg"
+		__dataset_upgrade_lset_version
+	fi
+
+	# Updated to include new 'bhyveload_flags' default properties.
+	if [ "$_DATASET_pool_version_int" = "0004" ]; then
+		__log 1 "Upgrading dataset to version 0005"
+		[ "$_PRIMARY_POOL" = "$_pool" ] && __write_property_value_to_config_file "defaults" "bhyveload_flags" ""
+		[ "$_PRIMARY_POOL" = "$_pool" ] && __write_property_value_to_config_file "defaults" "bhyve_disk_type" "ahci-hd"
+		__write_property_value_to_config_file "manual" "dataset_version" "0005" "/chyves/$_pool/.config/pool.cfg"
+		__dataset_upgrade_lset_version
+	fi
+
+	# Template for third change.
+	#if [ "$_DATASET_pool_version_int" = "0003" ]; then
+	#	__log 1 "Upgrading dataset to version 0004"
+	#	<ACTION>
+	#	__write_property_value_to_config_file "manual" "dataset_version" "0004" "/chyves/$_pool/.config/pool.cfg"
+	#	__dataset_upgrade_lset_version
+	#fi
+
+	# Upgrade guests on pool to latest chyves guest version if the primary pool is on the latest version.
+	_PRIMARY_pool_version_int="$( __return_property_value_from_config_file "manual" "dataset_version" "/chyves/$_PRIMARY_POOL/.config/pool.cfg" )"
+	if [ "$_PRIMARY_pool_version_int" = "$_VERSION_DATASET" ]; then
+		__guest_upgrade_chyves_guest_version "$( __return_new_line_delimit_as_comma_string $( __return_guest_list $_pool ) )"
+	fi
+}

@@ -1,0 +1,783 @@
+#!/bin/sh
+
+# Copyright (c) 2015, pr1ntf (Trent Thompson) All rights reserved.
+# Copyright (c) 2016, Justin D Holcomb All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Coverts a list to string that can be used for grep
+# List can be delimited by a single space for each item or a new line
+__convert_list_to_grep_string() {
+	local _string_to_convert="$1"
+	local _append_this="$2"
+
+	if [ -z "$_string_to_convert" ]; then
+		echo "$_UUID_GENERAL_USE"
+	else
+		local _var=$( echo "$_string_to_convert" | awk '{ print "^"$1"$" }' | tr '\n' '|' | sed -e 's/\|^$//' | sed -e 's/\|$//' )
+		if [ -z "$_append_this" ]; then
+			echo "$_var"
+		else
+			echo "${_var}|${_append_this}"
+		fi
+	fi
+}
+
+# Creates a symbolic link for non-OS pools on FreeNAS
+__freenas_create_symbolic_link() {
+	local _flag=$1
+
+	# If on FreeNAS do a couple of needed changes.
+	if [ "$( __return_one_if_freenas )" ]; then
+		__log 2 "On FreeNAS installation."
+		__log 3 "Checking for symbolic link to /chyves from /mnt/chyves..."
+		if [ -d /mnt/chyves ]; then
+			if [ ! -e /chyves ]; then
+				ln -s /mnt/chyves /chyves
+				if [ -L /chyves ]; then
+					__log 3 "Symbolic link to /chyves from /mnt/chyves successfully created."
+					[ "$_flag" = "-exit" ] && __log 1 "Recreating FreeNAS specific symbolic link for chyves. Please retry your command." && exit
+				else
+					__log 1 "Failed to create symbolic link."
+					__log 1 "Please manually do so by running the following as root:"
+					__log 1 "# ln -s /mnt/chyves /chyves"
+					exit
+				fi
+			elif [ -L /chyves ]; then
+				__log 3 "Symbolic link to /chyves already exists."
+			fi
+		elif [ -d /chyves ]; then
+			__log 3 "Symbolic link not needed. /chyves exists."
+			__log 3 "chyves likely is installed on the freenas-boot pool."
+			__log 3 "This is not recommended configuration."
+		else
+			__log 1 "chyves does not seem to be setup on this FreeNAS installation."
+		fi
+	fi
+}
+
+# Get guests name by supplied pid and set GV
+__gvset_guest_name_by_pid() {
+	local _pid="$1"
+
+	for _guest in `__return_guest_list - -space`
+	do
+		local _this_guest_pid=$( __return_guest_bhyve_pid )
+		[ -z "$_this_guest_pid" ] && continue
+		if [ "$_pid" -eq "$_this_guest_pid" ]; then
+			_GUEST_name_by_pid="$_guest"
+			break
+		fi
+	done
+}
+
+# Get pool name for guest and set GV
+__gvset_guest_pool() {
+	_GUEST_pool="$( zfs list -H -d 3 -t filesystem -r -o name | grep -w "chyves/guests/$_GUEST_name" | cut -d '/' -f 1 )"
+	__verify_valid_pool "$_GUEST_pool" -c
+}
+
+# Get primary pool name and set GV
+__gvset_primary_pool() {
+	_PRIMARY_POOL="$( echo "$_GLOBAL_CONFIG_FILE" | cut -d'/' -f3 )"
+	if [ -n "$_PRIMARY_POOL" ]; then
+		__verify_valid_pool "$_PRIMARY_POOL" "-p"
+	fi
+}
+
+# Converts user input to bytes
+__gvset_user_input_to_bytes() {
+	local _var="$1"
+
+	[ -n "$( echo "$_var" | grep -v -E '^[0-9]{1,}[kmgtKMGT]?$' )" ] && __fault_detected_exit "Unrecognized size: '$_var', must be any integer and optionally a suffix K, M, G, or T. Megabytes are assumed if not specified."
+
+	# Change to upper case for consistency
+	local _var=$( echo "$_var" | tr '[:lower:]' '[:upper:]' )
+
+	# Break _var into two parts number and size suffix
+	local _num=$( echo "$_var" | grep -o -E "[0-9]{1,}" )
+	local _suffix=$( echo "$_var" | grep -o "[kmgtKMGT]" )
+
+	# Multiple by 1024 for each size denomination
+	while [ -n "$_suffix" ]
+	do
+		local _num=$( expr 1024 \* $_num )
+		[ "$_suffix" = "K" ] && local _suffix=""
+		[ "$_suffix" = "M" ] && local _suffix="K"
+		[ "$_suffix" = "G" ] && local _suffix="M"
+		[ "$_suffix" = "T" ] && local _suffix="G"
+	done
+
+	# Assign to Global variable
+	_USER_input_to_bytes="$_num"
+}
+
+# Print help page
+__help() {
+__version
+cat << 'EOT'
+
+COMMANDS:
+chyves dataset <pool> {install|upgrade}
+chyves dev
+chyves {firmware|iso} list
+chyves {firmware|iso} import {http-URL|ftp-URL|local-path}
+chyves {firmware|iso} rename <resource> <new-resource-name>
+chyves {firmware|iso} delete <resource>
+chyves <guest> clone <clonenames>|MG [-ce|-cu|-ie|-iu] [<pool>]
+chyves <guest> console
+chyves <guest>|MG|all console {reset|tmux|vnc}
+chyves <guest>|MG create [<size>] [<pool>]
+chyves <guest>|MG|all delete [force|keepnet]
+chyves <guest> disk add [<size>]
+chyves <guest> disk disk{n} {description|notes} <annotation>
+chyves <guest> disk delete disk{n}
+chyves <guest> disk resize disk{n} <new-size>
+chyves <guest> disk list
+chyves <guest> get {<property>|all}
+chyves <guest>|MG|all reclaim
+chyves <guest> rename <new-guest-name>
+chyves <guest>|MG|global|defaults|all set <prop1>=<value>...
+chyves <guest> snapshot [<@snapshotname>]
+chyves <guest> snapshot list
+chyves <guest> snapshot delete <@snapshotname>
+chyves <guest> snapshot rollback [<@snapshotname>]
+chyves <guest>|MG|all start [<iso>]
+chyves <guest>|MG|all stop [force]
+chyves <guest>|MG|all upgrade
+chyves <guest>|MG|all unset <property>
+chyves help
+chyves info [-zbprvstcudnakwl|-h]
+chyves list [bridges|clones|defaults|disks|firmware|iso|pools|
+             properties|<property>]
+chyves list global [<pool>|primary]
+chyves list {processes|snapshots} [<guest>]
+chyves list tap active
+chyves network <guest> add {tap|tap{n}|vale{n}}
+chyves network <guest> add {tap|tap{n}} [bridge{n}]
+chyves network <guest> remove {tap{n}|vale{n}}
+chyves network bridge{n} attach {vlan-iface{n}|physical-iface{n}}
+chyves network bridge{n} {default|private}
+chyves network bridge{n} {join|unjoin} tap{n}
+chyves network bridge{n} migrate bridge{n}
+chyves upgrade [master|dev|check]
+chyves version
+
+SYNTAX NOMENCLATURE:
+The following syntax nomenclature is used above:
+ subcommand       - Required text, exactly as shown.
+ [subcommand]     - Optional text, exactly as shown.
+ <user-input>     - User supplied input field. Required when not contain in [ ].
+ {n}              - A whole number. Context determines valid range.
+ ...              - Repeating as many iterations as desired, follows the same
+                    preceding syntax pattern.
+ |                - Separates options in a list.
+ [optional|list]  - An optional field, list of valid options. "" meaning
+                    literally no input is also an option with these lists.
+ {require|list}   - A required field, list of valid options.
+ $null            - '', meaning literally no input.
+ [-abcdefg]       - An optional flag field but must start with a '-' and
+                    followed by any combination, in any order. Eg. '-gca'
+ <guest>          - chyves guest name
+ <pool>           - ZFS pool. The word "primary" can be used to specify the
+                    primary pool.
+ <size>           - Whole number with a size suffix in kilobytes (K), megabytes
+                    (M), gigabytes (G), or terabytes (T).
+ <iso>            - ISO resource name
+ <firmware>       - UEFI firmware resource name
+ MG               - Multiple guests can be given using commas. The word "all"
+                    can be used to indicate all guests for these commands.
+
+EOT
+}
+
+# First stage to process command line parameters for chyves
+__parse_cmd_ingress() {
+
+	# First stage of commands.
+	case "_$1" in
+		_dataset)      shift 1
+		              __parse_cmd_dataset $@
+		              exit
+		;;
+		_dev)         [ "$_DEV_MODE" == "off" ] && __fault_detected_exit "Developer mode is set to "off", if desired turn on by running 'chyves global set dev_mode=on'"
+		              __verify_number_of_arguments "2" "$#" "9"
+		              [ "$_DEV_MODE" != "on" ] && set "$_DEV_MODE"
+		              $2 "$3" "$4" "$5" "$6" "$7" "$8" "$9"           # Used for developer to test a function directly
+		              [ "$_DEV_MODE" != "on" ] && set "$( echo $_DEV_MODE | sed 's/-/+/g' )"
+		              exit
+		;;
+		_firmware)    __parse_cmd_resources $@
+		              exit
+		;;
+		_help|_-h|_)  __help
+		              exit
+		;;
+		_info)        __verify_number_of_arguments "1" "$#" "2"
+		              __info "$2"
+		              exit
+		;;
+		_iso)         __parse_cmd_resources $@
+		              exit
+		;;
+		_list)        shift 1
+		              __parse_cmd_list $@
+		              exit
+		;;
+		_network)     shift 1
+		              __parse_cmd_network $@
+		              exit
+		;;
+		_upgrade)     __verify_number_of_arguments "1" "$#" "2"
+		              __install_from_github $2
+		              exit
+		;;
+		_version)     __verify_number_of_arguments "1" "$#"
+		              __version
+		              exit
+		;;
+	esac
+
+	# Parameter $1 is likely a guest name - Stage 1 - create command
+	if [ "$2" = "create" ]; then                                                 # Completely verified
+		__root_credentials_required
+		__verify_number_of_arguments "2" "$#" "4"
+		__verify_correct_guest_name_format "$1"
+		[ -n "$4" ] && __verify_valid_pool "$4" "-c"
+		__create "$1" "$3" "$4"
+		exit
+
+	# Parameter $1 is likely a guest name - Stage 1 - clone command
+	elif [ "$2" = "clone" ]; then
+		__root_credentials_required
+		__verify_number_of_arguments "3" "$#" "5"
+		__verify_correct_guest_name_format "$3"
+		__verify_guests $1
+		__load_one_guest_parameters "$1"
+		[ -n "$5" ] && __verify_valid_pool "$5" "-c"
+		__clone_guest "$3" "$4" "$5"
+		exit
+	fi
+
+	# Guest ($1) should already exists for the commands below
+	__verify_guests $1
+
+	# Parameter $1 is likely a guest name - Stage 2 - Guest exists
+	case "$2" in
+		console)  __parse_cmd_console "$@"                                          # Completely verified
+		          exit
+		;;
+		delete)   __root_credentials_required                                      # Mostly verified
+		          __verify_number_of_arguments "2" "$#" "3"
+		          __guest_delete "$1" "$3"
+		          exit
+		;;
+		disk)     __parse_cmd_disk "$@"                                            # Mostly verified
+		          exit
+		;;
+		get)      __verify_number_of_arguments "2" "$#" "3"
+		          __get "$1" "$3"
+		          exit
+		;;
+		reclaim)  __root_credentials_required                                      # Mostly verified
+		          __verify_number_of_arguments "2" "$#" "2"
+		          __destroy_guest_vmm_resouces "$1"
+		          exit
+		;;
+		rename)   __root_credentials_required
+		          __verify_number_of_arguments "3" "$#" "3"
+		          __verify_correct_guest_name_format "$3"
+		          __load_one_guest_parameters "$1"
+		          __guest_rename "$3"
+		          exit
+		;;
+		set)      __root_credentials_required
+		          __verify_number_of_arguments "3" "$#"
+		          __set "$@"
+		          exit
+		;;
+		snapshot) __parse_cmd_snapshot "$@"
+		          exit
+		;;
+		start)    __root_credentials_required                                      # Mostly verified
+		          __verify_number_of_arguments "2" "$#" "3"
+		          [ -n "$3" ] && __verify_valid_dataset "ISO/$3"
+		          __start "$1" "$3"
+		          exit
+		;;
+		stop)     __root_credentials_required
+		          __verify_number_of_arguments "2" "$#" "3"
+		          [ -n "$3" ] && [ "$3" = "force" ] && __destroy_guest_vmm_resouces "$1" "$3" && exit
+		          __stop_guest_gracefully "$1"
+		          exit
+		;;
+		upgrade)  __root_credentials_required                                      # Mostly verified
+		          __verify_number_of_arguments "2" "$#" "2"
+		          __guest_upgrade_chyves_guest_version "$1"
+		          exit
+		;;
+		unset)    __root_credentials_required
+		          __verify_number_of_arguments "3" "$#" "3"
+		          __remove_property_in_guest_config_file "$1" "$3"
+		          exit
+		;;
+		*)        __help
+		          __fault_detected_exit "Unrecognized command: $@. See above for list of correct commands and syntax."
+		;;
+	esac
+}
+
+# Command parser for console tasks
+__parse_cmd_console() {
+
+	# Verify/Load console kernel module (nmdm).
+	if [ "$_AUTO_LOAD_KERNEL_MODS" = "yes" ]; then
+		__verify_kernel_module_loaded nmdm -l      # This checks and loads the missing nmdm module.
+	else
+		__verify_kernel_module_loaded nmdm         # This only checks but does not load nmdm module.
+	fi
+
+	if [ -z "$3" ] || [ "$3" = "vnc" ]; then
+		__load_one_guest_parameters "$1"
+	else
+		__verify_guests "$1"
+	fi
+
+	# chyves $_GUEST_name console $1
+	case "_$3" in
+		_)        __verify_number_of_arguments "2" "$#" "2"
+		          __console_run
+		          exit
+		;;
+		_reset)   __verify_number_of_arguments "3" "$#" "3"
+		          __console_reset "$1"
+		          exit
+		;;
+		_tmux)    __verify_number_of_arguments "3" "$#" "3"
+		          __verify_binary_available tmux
+		          __console_tmux $1
+		          exit
+		;;
+		_vnc)     __verify_number_of_arguments "3" "$#" "3"
+		          [ "$_GP_loader" != "uefi" ] && __fault_detected_exit "Guest 'loader' must be set to 'uefi'."
+		          [ "$_GP_uefi_console_output" != "vnc" ] && __fault_detected_exit "Guest 'uefi_console_output' must be set to 'vnc'."
+		          [ "$_GP_uefi_vnc_pause_until_client_connect" = "yes" ] && __log 1 "Guest will wait to start until VNC connection is started." && sleep 3
+		          [ "$_GP_uefi_vnc_mouse_type" = "ps2" ] && __log 1 "Guest will likely be jumpy, scientific term. If OS is newer, try setting 'uefi_vnc_mouse_type' to 'usb3'."
+		          __log 1 "Starting VNC client: $_GP_uefi_vnc_client"
+		          __console_vnc_$_GP_uefi_vnc_client
+		          exit
+		;;
+		*)        __help
+		          __fault_detected_exit "Unrecognized syntax: $@. See above for sub-commands and syntax."
+		;;
+	esac
+}
+
+# Command parser for dataset
+__parse_cmd_dataset() {
+	__root_credentials_required
+	__verify_number_of_arguments "2" "$#" "2"
+
+	# Load chyves-dataset library
+	. "$_LIBRARY_PATH/chyves-dataset"
+
+	# chyves $_GUEST_name console $1
+	case "$2" in
+		install)    __verify_valid_pool "$1" -cn
+		            __dataset_install "$1"
+		            exit
+		;;
+		upgrade)    __verify_valid_pool "$1" -c
+		            __dataset_upgrade "$1"
+		            exit
+		;;
+	esac
+
+	__help
+	__fault_detected_exit "Unrecognized syntax: $@. See above for sub-commands and syntax."
+}
+
+# Command parser for disk manipulations on guests
+__parse_cmd_disk() {
+	__root_credentials_required
+	__load_one_guest_parameters "$1"
+
+	# chyves $_GUEST_name disk <command> $4
+	case "$3" in
+		add)      __verify_number_of_arguments "3" "$#" "4"
+		          __add_guest_disk "$4"
+		          exit
+		;;
+		delete)   __verify_number_of_arguments "4" "$#" "4"
+		          __delete_guest_disk "$4"
+		          exit
+		;;
+		list)     __verify_number_of_arguments "3" "$#" "3"
+		          __info "-zdn" "$1"
+		          exit
+		;;
+		resize)   __verify_number_of_arguments "5" "$#" "5"
+		          __resize_guest_disk "$4" "$5"
+		          exit
+		;;
+	esac
+
+	# chyves $_GUEST_name disk <command> $4
+	case "$4" in
+		description)  __verify_number_of_arguments "5" "$#" "5"
+		              local _value="$5"
+		              __verify_valid_dataset "guests/$_GUEST_name/$3"
+		              __verify_user_input_for_properties "description" "$5" "guests"
+		              [ -n "$_ADJUSTED_value" ] && local _value="$_ADJUSTED_value"
+		              _RESTRICT_NEW_PROPERTY_NAMES="master-override"
+		              __write_property_value_to_config_file "guest" "$3_description" "$_value"
+		              exit
+		;;
+		notes)        __verify_number_of_arguments "5" "$#" "5"
+		              local _value="$5"
+		              __verify_valid_dataset "guests/$_GUEST_name/$3"
+		              __verify_user_input_for_properties "notes" "$5" "guests"
+		              [ -n "$_ADJUSTED_value" ] && local _value="$_ADJUSTED_value"
+		              _RESTRICT_NEW_PROPERTY_NAMES="master-override"
+		              __write_property_value_to_config_file "guest" "$3_notes" "$_value"
+		              exit
+		;;
+	esac
+
+	__help
+	__fault_detected_exit "Unrecognized syntax: $@. See above for sub-commands and syntax."
+}
+
+# Command parser for list commands on guests
+__parse_cmd_list() {
+
+	# chyves list $2
+	case "_$1" in
+		_)            _CALLED_from_list=1
+		              __info "$_DEFAULT_LIST_FLAGS"
+		              exit
+		;;
+		_-*)          __fault_detected_exit "Only the 'chyves info' command uses flags directly, the property 'default_list_flags' can be set to change the output of 'chyves list' as it shares the same backend mechanism as 'chyves info'."
+		              exit
+		;;
+		_bridges)     __verify_number_of_arguments "1" "$#" "1"
+		              __list_bridges
+		              exit
+		;;
+		_clones)      __verify_number_of_arguments "1" "$#" "1"
+		              __list_clones
+		              exit
+		;;
+		_defaults)    __verify_number_of_arguments "1" "$#" "1"
+		              __list_defaults
+		              exit
+		;;
+		_disks)       __verify_number_of_arguments "1" "$#" "1"
+		              __info "-zdn"
+		              exit
+		;;
+		_firmware)    __verify_number_of_arguments "1" "$#" "1"
+		              __list_firmware
+		              exit
+		;;
+		_global)      __verify_number_of_arguments "1" "$#" "2"
+		              [ -n "$2" ] && __verify_valid_pool "$2" "-c"
+		              __list_global_properties "$2"
+		              exit
+		;;
+		_iso)         __verify_number_of_arguments "1" "$#" "1"
+		              __list_iso
+		              exit
+		;;
+		_pools)       __verify_number_of_arguments "1" "$#" "1"
+		              __list_pools
+		              exit
+		;;
+		_processes)   __verify_number_of_arguments "1" "$#" "2"
+		              [ -n "$2" ] && __load_one_guest_parameters "$2"
+		              __list_processes
+		              exit
+		;;
+		_properties)  __verify_number_of_arguments "1" "$#" "1"
+		              __list_properties
+		              exit
+		;;
+		_snapshots)   __verify_number_of_arguments "1" "$#" "2"                    # Review after rewrite
+		              [ -n "$2" ] && __load_one_guest_parameters "$2"
+		              __list_snapshots
+		              exit
+		;;
+		_tap)         __verify_number_of_arguments "2" "$#" "2"
+		              [ "$2" != "active" ] && __fault_detected_exit "To see active taps run 'chyves list tap active' or run 'chyves list net_ifaces'"
+		              __list_active_taps
+		              exit
+		;;
+	esac
+
+	# Handling for 'chyves list <property>'
+	if [ -n "$( __return_property_list | grep "$1" )" ]; then
+		__verify_number_of_arguments "1" "$#" "1"
+		__list_single_property "$1"
+	else
+		__help
+		__fault_detected_exit "Unknown command 'chyves list $1'"
+	fi
+}
+
+# Command parser for network tasks
+__parse_cmd_network() {
+	local _action _bridge _dev2
+	local _device="$1"
+	local _action="$2"
+	local _dev2="$3"
+	__root_credentials_required
+
+	[ "$_NETWORK_DESIGN_MODE" = "system" ] && __fault_detected_exit "The 'chyves network' commands are for use when 'network_design_mode' is set to 'auto', currently it is set to 'system'. All network configuration must be manually managed in the system. Turning the mode to 'auto' does not just \"fix\" things. Each tap interface will need to be associated with a bridge."
+
+	# Verify $_device is a bridge when not using add|remove
+	if [ "$_action" = "remove" ] || [ "$_action" = "add" ]; then
+	else
+		__verify_valid_iface_format "$_device"
+		local _device_type="$_IFACE_type"
+		[ "$_device_type" != "bridge" ] && __fault_detected_exit "Incorrect syntax used, first device must be a bridge except for network add|remove actions."
+	fi
+
+	case "$_action" in
+		add)      __verify_number_of_arguments "3" "$#" "4"
+		          local _guest="$_device"
+		          local _bridge_to_attach="$4"
+		          __verify_guests $_device
+		          [ -n "$( __return_guest_bhyve_pid )" ] && __fault_detected_exit "Guest is running, please shutdown before changing network configuration."
+		          [ "$_dev2" = "tap" ] && __get_next_tap && local _dev2="$_NEXT_tap" # Populate tap interface variable if the word "tap" is used.
+		          __verify_valid_iface_format "$_dev2"
+		          local _dev2_type="$_IFACE_type" # Verify tap/vale interface
+		          [ "$_dev2_type" = "tap" ] && __verify_tap_not_in_use $_dev2 # Do not allow tap to be join if used elsewhere
+		          [ "$_dev2_type" != "vale" ] && [ "$_dev2_type" != "tap" ] && __fault_detected_exit "Incorrect syntax used ( chyves network $* ). Must use: 'chyves network {name} add [tap{n}|vale{n}[:{p}]] [bridge{n}]'." # If $_dev2 is not a vale or tap then exit
+		          [ -n "$_bridge_to_attach" ] && __verify_valid_iface_format "$4" && [ "$_IFACE_type" != "bridge" ] && __fault_detected_exit "$_bridge_to_attach is not a bridge, correct syntax is: 'chyves network <guest> add {tap|tap{n}} bridge{n}'."
+		          __load_one_guest_parameters "$_guest"
+		          __network_add "$_dev2" "$_bridge_to_attach"
+		          exit
+		;;
+		remove)   __verify_number_of_arguments "3" "$#" "3"
+		          local _guest="$_device"
+		          __verify_guests $_guest
+		          [ -n "$( __return_guest_bhyve_pid )" ] && __fault_detected_exit "Guest is running, please shutdown before changing network configuration."
+		          __verify_valid_iface_format "$_dev2"
+		          local _dev2_type="$_IFACE_type"
+		          [ "$_dev2_type" != "tap" ] && [ "$_dev2_type" != "vale" ] && __fault_detected_exit "Incorrect syntax used ( chyves network $* ). Must use: 'chyves network <guest> remove [tap{n}|vale{n}[:{p}]]'." # If $_dev2 is not a vale or tap exit
+		          __load_one_guest_parameters "$_guest"
+		          __verify_iface_on_guest "$_dev2"
+		          __network_remove "$_dev2"
+		          exit
+		;;
+		default)  __verify_number_of_arguments "2" "$#" "2"
+		          __write_property_value_to_config_file "defaults" "bridge" "$_device"
+		          exit
+		;;
+		private)  __verify_number_of_arguments "2" "$#" "2"
+		          __verify_valid_system_iface "$_device" -c
+		          __network_private "$_device"
+		          exit
+		;;
+		attach)   __verify_number_of_arguments "3" "$#" "3"
+		          __verify_valid_iface_format "$_dev2"
+		          local _dev2_type="$_IFACE_type"
+		          [ "$_dev2_type" != "vlan" ] && [ "$_dev2_type" != "physical" ] && __fault_detected_exit "Incorrect syntax used, second device must be a physical or VLAN interface. If '$3' is a VLAN interface, update the global property 'vlan_iface_base_name'"
+		          __network_attach "$1" "$3"
+		          exit
+		;;
+		join)     __verify_number_of_arguments "3" "$#" "3"
+		          __verify_valid_iface_format "$_dev2"
+		          local _dev2_type="$_IFACE_type"
+		          [ "$_dev2_type" != "tap" ] && __fault_detected_exit "Incorrect syntax used, second parameter must be a tap interface. 'chyves network $_device join tap{n}'." # If $_dev2 is not a vale or tap exit
+		          __network_bridge_join "$1" "$3"
+		          exit
+		;;
+		migrate)  __verify_number_of_arguments "3" "$#" "3"
+		          __verify_valid_iface_format "$_dev2"
+		          local _dev2_type="$_IFACE_type"
+		          [ "$_dev2_type" != "bridge" ] && __fault_detected_exit "Incorrect syntax used, second device must be a bridge interface."
+		          __network_bridge_migrate "$1" "$3"
+		          exit
+		;;
+		unjoin)   __verify_number_of_arguments "3" "$#" "3"
+		          __verify_valid_iface_format "$_dev2"
+		          local _dev2_type="$_IFACE_type"
+		          [ "$_dev2_type" != "tap" ] && __fault_detected_exit "Incorrect syntax used, second parameter must be a tap interface. 'chyves network $_device unjoin tap{n}'." # If $_dev2 is not a vale or tap exit
+		          __network_bridge_unjoin "$1" "$3"
+		          exit
+		;;
+		*)        __help
+		          __fault_detected_exit "Unrecognized network command '$_action'. See above for correct syntax."
+		;;
+	esac
+}
+
+# Command parser for chyves resources
+__parse_cmd_resources() {
+	local _resource_type="$1"
+	local _command="$2"
+	local _resource="$3"
+
+	# List Firmware resources
+	if [ "$_command" = "list" ] && [ "$_resource_type" = "firmware" ]; then
+		__verify_number_of_arguments "2" "$#" "2"
+		__list_firmware
+		exit
+
+	# List ISO resources
+	elif [ "$_command" = "list" ] && [ "$_resource_type" = "iso" ]; then
+		__verify_number_of_arguments "2" "$#" "2"
+		__list_iso
+		exit
+	fi
+
+	case "$_command" in
+		delete)   __verify_number_of_arguments "3" "$#" "3"
+		          __resource_delete "$_resource_type" "$_resource"
+		          exit
+		;;
+		import)   __verify_number_of_arguments "3" "$#" "3"
+		          __resource_import "$_resource_type" "$_resource"
+		          exit
+		;;
+		rename)   __verify_number_of_arguments "4" "$#" "4"
+		          __resource_rename "$_resource_type" "$_resource" "$4"
+		          exit
+		;;
+		*)        __help
+		          __fault_detected_exit "Unrecognized network command '$*'. See above for correct syntax."
+		;;
+	esac
+}
+
+# Command parser for snapshots
+__parse_cmd_snapshot() {
+	local _single_guest="$1"
+	local _arg3="$3"
+	local _rollback_to_snapshot="$4"
+	#local _arg3="$( echo $3 | cut -d '@' -f2 )"
+	#local _rollback_to_snapshot="$( echo $4 | cut -d '@' -f2 )"
+	__verify_number_of_arguments "2" "$#" "4"
+	__root_credentials_required
+	__load_one_guest_parameters "$_single_guest"
+
+	# List snapshots for guest.
+	if [ "$_arg3" = "list" ]; then
+		__list_snapshots
+
+	# Rollback guest
+	elif [ "$_arg3" = "rollback" ]; then
+		local _latest_snapshot="$( __return_guest_snapshot_last )"
+		[ -z "$_rollback_to_snapshot" ] && local _rollback_to_snapshot="$_latest_snapshot"
+		[ -z "$_rollback_to_snapshot" ] && __fault_detected_exit "No snapshots taken for $_GUEST_name"
+		__verify_valid_dataset "guests/$_GUEST_name$_rollback_to_snapshot"
+
+		[ -n "$( __return_guest_bhyve_pid )" ] && __fault_detected_exit "$_GUEST_name must be stopped before rolling back snapshot."
+
+		__log 1 "The recursive snapshots to be deleted:"
+
+		# List the snapshots that will be deleted by rollingback
+		for _dataset in `zfs list -H -t volume,filesystem -r -o name $_GUEST_pool/chyves/guests/$_GUEST_name | tr '\n' ' '`
+		do
+			zfs list -H -d 1 -t snapshot -o name $_dataset | grep -A999999 -w "$_dataset$_rollback_to_snapshot" | grep -v -w "$_dataset$_rollback_to_snapshot" | cut -d'/' -f4- | awk '{ print "   "$1 }'
+		done
+
+		read -p "[WARNING] Do you want to delete all data created after the snapshot including the recursive snapshot above: [y/N]? " _delete_or_no </dev/tty
+
+		case "$_delete_or_no" in
+			y|Y|yes)  # Send to backend
+			          __rollback_guest_snapshot "$_rollback_to_snapshot"
+			;;
+			*) __log 1 "$_GUEST_name was not rolled back."
+		esac
+		exit
+
+	# Delete a guest's snapshot
+	elif [ "$_arg3" = "delete" ]; then
+		__verify_number_of_arguments "3" "$#" "4"
+		local _snapshot_name="$4"
+		[ -z "$_snapshot_name" ] && local _snapshot_name="$( __return_guest_snapshot_last )"
+		[ -z "$_snapshot_name" ] && __fault_detected_exit "No snapshots taken for $_GUEST_name"
+
+		# Verify snapshots exists and split if a range is specified.
+		# Using this method allows deleting non-top level guest snapshots, such as the ones created for clones.
+		zfs destroy -rnv $_GUEST_pool/chyves/guests/$_GUEST_name$_snapshot_name > /dev/null 2>&1
+		if [ "$?" != 0 ]; then
+			__fault_detected_exit "Invalid snapshot name."
+		else
+
+			# Print the snapshots to be destroyed. The '-n' flag is to do a dry-run ("No-op").
+			__log 1 "The recursive snapshots to be deleted:"
+			zfs destroy -rnv $_GUEST_pool/chyves/guests/$_GUEST_name$_snapshot_name
+		fi
+
+		read -p "[WARNING] Do you want to delete the above snapshots: [y/N]? " _delete_or_no </dev/tty
+		case "$_delete_or_no" in
+			y|Y|yes)  # Send to backend
+			          __destroy_guest_snapshot "$_snapshot_name"
+			;;
+			*) __log 1 "$_GUEST_pool/chyves/guests/$_GUEST_name$_snapshot_name was not destroyed."
+		esac
+		exit
+
+	# Take snapshot of guest
+	elif [ -z "$_arg3" ] || [ -n "$( echo "$_arg3" | grep -E '^@' )" ]; then
+		local _snapshot_name="$_arg3"
+
+		# Give generic name when not supplied.
+		[ -z "$_snapshot_name" ] && local _snapshot_name="@chyves-auto-named-snapshot-$_DATE_YMDMHS"
+
+		# Run input verification
+		[ -z "$( echo "$_snapshot_name" | grep -E '^\@[-0-9a-zA-Z._]{1,}$' )" ] && __fault_detected_exit "Incorrect snapshot name format. Must start with an '@' and can contain number, letters, dashes '-', periods '.', and/or underscores '_'."
+
+		# Append a message indicating system was running when bhyve pid detected.
+		[ -n "$( __return_guest_bhyve_pid )" ] && local _snapshot_name="${_snapshot_name}-LIVE-SYSTEM"
+
+		# Send to backend
+		__snapshot_guest "$_snapshot_name"
+		exit
+
+	else
+		__help
+		__fault_detected_exit "Unknown snapshot command."
+	fi
+}
+
+# Checks to see if running with root credentials is required.
+__root_credentials_required() {
+
+	# See if running with root credentials. -u flag for id 'Display the effective user ID as a number.'
+	[ "$( id -u )" != 0 ] && __fault_detected_exit "'$@' command requires root credentials!"
+}
+
+# Show version
+__version() {
+	__log 1 "chyves $_VERSION_LONG"
+	__log 1 "chyves branch: '$_VERSION_BRANCH'"
+	__log 1 "chyves dataset version: $_VERSION_DATASET"
+	__log 1 "chyves guest version: $_VERSION_CHYVES_GUEST"
+	[ -n "$_OS_VERSION_FREENAS" ] && __log 1 "On $_OS_VERSION_FREENAS"
+	__log 1 "On $_OS $_OS_VERSION_REL"
+	__log 1 "$_OS commit: r$_OS_VERSION_COMMIT"
+	__log 1 "$_OS version revision: $_OS_VERSION_DATE"
+}

@@ -1,0 +1,780 @@
+#!/bin/sh
+
+# Copyright (c) 2015, pr1ntf (Trent Thompson) All rights reserved.
+# Copyright (c) 2016, Justin D Holcomb All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Generates a bhyve slot string for custom PCI devices
+__generate_bhyve_custom_pci_string() {
+	local _custom_pci_devs="$( grep -E "^pcidev_" $_GUEST_config_file | cut -d'=' -f2- | sort -V )"
+
+	# Special handling for PCI passthrough devices
+	if [ -n "$( echo "$_custom_pci_devs" | grep 'passthru,' )" ]; then
+
+		# Verify VT-d capable CPU when using using PCI passthrough
+		__verify_iommu_capable
+
+		# Get unique physical devices on host that share the same PCI slot number
+		for _single_pci_phy in `echo "$_custom_pci_devs" | grep -o -E 'passthru,[0-9]{1,3}\/[0-9]{1,3}\/[0-9]{1,3}' | cut -d',' -f2 | cut -d'/' -f1 | uniq | tr '\n' ' '`
+		do
+			# Generate complete bhyve string under one PCI slot per physical device on host.
+			local _devs_for_phy="$( echo "$_custom_pci_devs" | sort -k1 | grep -o -E "passthru,$_single_pci_phy\/[0-9]{1,3}\/[0-9]{1,3}"  | tr '\n' ' ' )"
+			__generate_bhyve_slot_string "$_devs_for_phy" 1 yes
+			local _processed_string="$_processed_string $_BHYVE_slot_string"
+		done
+	fi
+
+	# Handling for other custom PCI devices
+	for _pci in `echo "$_custom_pci_devs" | grep -v 'passthru,' | tr '\n' ' '`
+	do
+		__generate_bhyve_slot_string "$_pci" "" no
+		local _processed_string="$_processed_string $_BHYVE_slot_string"
+	done
+
+	_BHYVE_custom_pci_string="$_processed_string"
+}
+
+# Generates a bhyve slot string for disks
+__generate_bhyve_disk_string() {
+	local _counter_32dev=0
+	local _num_of_disks_counter=1
+
+	[ "$_GUEST_disk_list_count" = 0 ] && echo "Guest has no disks." && return 0
+
+	# Use 32 device attachment on supported guests.
+	if [ "$_OS_VERSION_DATE" -ge "1200000" ]; then
+		if [ "$_OS_VERSION_COMMIT" -ge "302459" ]; then
+			local _32dev_support=1
+		fi
+	elif [ "$_OS_VERSION_DATE" -ge "1100000" ]; then
+		if [ "$_OS_VERSION_COMMIT" -ge "304422" ]; then
+			local _32dev_support=1
+		fi
+	elif [ "$_OS_VERSION_DATE" -ge "1000000" ]; then
+		if [ "$_OS_VERSION_COMMIT" -ge "304420" ]; then
+			local _32dev_support=1
+		fi
+	fi
+
+	# Use individual attachment if not consolidating bhyve PCI devices
+	[ "$_CONSOLIDATE_BHYVE_PCI_DEVICES" = "no" ] && local _32dev_support=
+
+	# virtio-blk must use PCI functions for attachment
+	[ "$_GP_bhyve_disk_type" = "virtio-blk" ] && local _32dev_support=
+
+	# Create device list for bhyve
+	for _disk_dataset in `echo $_GUEST_disk_list`
+	do
+
+		# Parse disk name for pulling property
+		local _disk_name="$( basename $_disk_dataset )"
+
+		# See man page Advanced Properties section for more info.
+		local _virtio_block_options=$( __return_property_value_from_config_file "guest" "virtio_block_options_$_disk_name" )
+
+		# Attach up to 8 disk through PCI functions per bhyve PCI slot.
+		if [ ! "$_32dev_support" ]; then
+
+			# Typical handling
+			if [ -z "$_virtio_block_options" ]; then
+
+				# Pull the blocksize on the ZFS volume to optimize performance.
+				#local _disk_blocksize="$( zfs get -H -p -o value volblocksize "$_disk_dataset" )"
+				#local _string="$_string ${_GP_bhyve_disk_type},$_disk_dataset,sectorsize=$_disk_blocksize"
+
+				# Temporary as only 512 byte size works.
+				local _string="$_string ${_GP_bhyve_disk_type},$_disk_dataset"
+
+			# Handling if the expert property (virtio_block_options) is set. See man page Advanced Properties section for more info.
+			else
+				local _string="$_string ${_GP_bhyve_disk_type},$_disk_dataset,$_virtio_block_options"
+				local _virtio_block_options=""
+			fi
+
+		# Attach up to 32 disks to one AHCI controller / PCI slot, new syntax makes this complicated.
+		elif [ "$_32dev_support" ]; then
+
+			# Only disk handling
+			if [ "$_GUEST_disk_list_count" = 1 ]; then
+				local _string="ahci,hd:$_disk_dataset"
+				__generate_bhyve_slot_string $_string 1
+				local _bhyve_disk_string_stage2="$_BHYVE_slot_string"
+
+			# First disk of multiple
+			elif [ "$_counter_32dev" = 0 ]; then
+				local _string="ahci,hd:$_disk_dataset"
+				local _counter_32dev="$( expr 1 + $_counter_32dev )"
+
+			# Last disk of multiple
+			elif [ "$_counter_32dev" = 31 ] || [ "$_GUEST_disk_list_count" = "$_num_of_disks_counter" ]; then
+
+				local _string="${_string},hd:$_disk_dataset"
+
+				__generate_bhyve_slot_string $_string 1
+				local _bhyve_disk_string_stage2="$_bhyve_disk_string_stage2 $_BHYVE_slot_string"
+				local _string=""
+				local _counter_32dev=0
+
+			# Not first or last of multiple disks
+			else
+				local _string="${_string},hd:$_disk_dataset"
+				local _counter_32dev="$( expr 1 + $_counter_32dev )"
+			fi
+
+			local _num_of_disks_counter="$( expr 1 + $_num_of_disks_counter )"
+		fi
+	done
+
+	# Guests supporting only 8 devices need to generate the bhyve PCI string.
+	if [ ! "$_32dev_support" ]; then
+
+		# UEFI can only use PCI slots 3-7 for ACHI devices, PCI slot 3 is used for optical, 3 slots remaining for disks.
+		if [ "$_GP_loader" = "uefi" ] && [ "$_GUEST_disk_list_count" -gt 3 ]; then
+			__generate_bhyve_slot_string $_string 3
+
+		# Other loader types do no have this restriction.
+		else
+			__generate_bhyve_slot_string "$_string"
+		fi
+
+		_BHYVE_disk_string="$_BHYVE_slot_string"
+
+	# Hosts with 32 device support have already generated the bhyve string.
+	elif [ "$_32dev_support" ]; then
+		_BHYVE_disk_string="$_bhyve_disk_string_stage2"
+	fi
+}
+
+# Generate bhyve slot string for network devices.
+__generate_bhyve_net_string() {
+
+	# Setup interfaces if any are configured.
+	for _iface in `echo "$_GP_net_ifaces" | tr ',' '\n'`
+	do
+		[ "$_iface" = "-" ] || [ "$_iface" = "" ] && continue
+		local _mac
+
+		__verify_valid_system_iface $_iface -c
+
+		# Action for VALE interfaces
+		if [ "$_IFACE_type" = "vale" ]; then
+			# Verify one time only if system is compatiable with VALE.
+			[ -z "$_VALE_system_compat" ] && __verify_vale_system_compat
+
+		# Action for tap interfaces
+		elif [ "$_IFACE_type" = "tap" ]; then
+			# Get mac address for tap
+			local _mac="$( __return_property_value_from_config_file "guest" "${_iface}_mac" )"
+
+			# _NETWORK_DESIGN_MODE handling
+			if [ "$_NETWORK_DESIGN_MODE" = "auto" ]; then
+				__get_parent_bridge_for_tap_chyves $_iface
+				__network_add_phy_to_bridge $_PARENT_bridge_for_tap_chyves
+				__network_add_dev_to_bridge $_PARENT_bridge_for_tap_chyves $_iface
+			elif [ "$_NETWORK_DESIGN_MODE" = "system" ]; then
+				[ ! -e "/dev/$_iface" ] && __log 1 "Network design mode set to 'system' however tap interface not detected on system." && break 2
+			fi
+
+			# Error message when guest does not meet requirement for Intel e1000 emulation.
+			if [ "$_GP_bhyve_net_type" = "e1000" ]; then
+				if [ "$_OS_VERSION_DATE" -ge "1200000" ]; then
+					if [ "$_OS_VERSION_COMMIT" -lt "302504" ]; then
+						__log 1 "The current FreeBSD version 12 ($_OS_VERSION_DATE r$_OS_VERSION_COMMIT) is incompataible with Intel e1000 emulation as it is prior to commit r302504, falling back to 'virtio-net' attachment."
+						_GP_bhyve_net_type=virtio-net
+					fi
+				elif [ "$_OS_VERSION_DATE" -ge "1100000" ]; then
+					if [ "$_OS_VERSION_COMMIT" -lt "304424" ]; then
+						__log 1 "The current FreeBSD version 11 ($_OS_VERSION_DATE r$_OS_VERSION_COMMIT) is incompataible with Intel e1000 emulation as it is prior to commit r304424, falling back to 'virtio-net' attachment."
+						_GP_bhyve_net_type=virtio-net
+					fi
+				elif [ "$_OS_VERSION_DATE" -ge "1000000" ]; then
+					if [ "$_OS_VERSION_COMMIT" -lt "304425" ]; then
+						__log 1 "The current FreeBSD version 10 ($_OS_VERSION_DATE r$_OS_VERSION_COMMIT) is incompataible with Intel e1000 emulation as it is prior to commit r304425, falling back to 'virtio-net' attachment."
+						_GP_bhyve_net_type=virtio-net
+					fi
+				else
+					__log 1 "This FreeBSD version is not able to emulate an Intel e1000 NIC, falling back to 'virtio-net' attachment."
+					_GP_bhyve_net_type=virtio-net
+				fi
+			fi
+		else
+			__fault_detected_exit "Only tap and VALE network interfaces can be attached to bhyve guests. $_iface was detected as a $_IFACE_type interface."
+		fi
+
+		# Add a PCI device for the network interface
+		__log 2 "Attaching $_iface interface using $_GP_bhyve_net_type."
+		[ -z "$_mac" ] && local _string="$_string ${_GP_bhyve_net_type},$_iface"
+		[ -n "$_mac" ] && local _string="$_string ${_GP_bhyve_net_type},$_iface,mac=${_mac}"
+	done
+
+	__generate_bhyve_slot_string "$_string"
+	_BHYVE_net_string="$_BHYVE_slot_string"
+}
+
+# Generates a bhyve PCI slot string from $1
+__generate_bhyve_slot_string() {
+	local _in_string="$1"                                                    # Required, contains string that is space separated
+	local _max_slot="$2"                                                     # Optional, maximum number of buses to use. Important for UEFI ACHI drives.
+	local _use_pci_funcions="${3-$_CONSOLIDATE_BHYVE_PCI_DEVICES}"           # Optional with default, use PCI functions. Important for PCI passthrough so physical devices are on same slot. Uses $_CONSOLIDATE_BHYVE_PCI_DEVICES if no set.
+	local _max_slot_count=1                                                  # Seeds counter used to ensure maximum slots are not exceeded.
+	local _num_devices="$( echo $_in_string | tr ' ' '\n' | grep -c "" )"    # Number of devices to connect from $_in_string, implies slot usage
+	local _func=0                                                            # Seeds PCI function number
+	local _device_counter=0                                                  # Seeds counter
+
+	# Return when empty string is provided but erase $_BHYVE_slot_string beforehand.
+	[ -z "$_in_string" ] && _BHYVE_slot_string="" && return 0
+
+	# Populate $_PCI_slot if empty.
+	[ -z "$_PCI_slot" ] && _PCI_slot="$_PCI_SLOT_START"
+
+	# When on PCI slot 30 or 31, max slot is '1' otherwise dwindle down the number of max slot when not specified.
+	if [ -z "$_max_slot" ]; then
+		if [ "$_PCI_slot" -ge 30 ]; then
+			local _max_slot=1
+		else
+			local _max_slot=$( expr 30 - $_PCI_slot )
+		fi
+	fi
+
+	# Do not attempt to attach anything after bhyve PCI slot 30.
+	if [ "$_PCI_slot" -gt 30 ]; then
+		__log 1 "No additional bhyve PCI slots are available, can not attach: $_in_string"
+		__log 1 "To consolidate similar devices to same PCI slot, run: 'chyves global set consolidate_bhyve_pci_devices=yes'"
+		_BHYVE_slot_string="" # Need to void out current value.
+		return 1
+	fi
+
+	# Choose whether or not to use PCI functions or only use on device per slot
+	if [ "$_num_devices" -gt "$_max_slot" ] || [ "$_use_pci_funcions" = "yes" ]; then
+		local _per_slot=$( expr $_num_devices / $_max_slot )
+
+		# Tell user that chyves can not exceed bhyve's eight PCI functions per PCI slot limit.
+		if [ "$_per_slot" -gt 7 ] || [ "$_use_pci_funcions" = "yes" ]; then
+			__log 1 "More devices than available PCI Slots and PCI functions can provide, some devices will not be attached."
+			local _per_slot=7
+		fi
+
+	# Use one device per PCI Slot when there are abundant PCI slots available
+	else
+		local _per_slot="0"
+	fi
+
+	# Create the string.
+	for _str in $_in_string
+	do
+
+		local _device_counter="$( expr 1 + $_device_counter )"
+		# Skip these off limit PCI slot numbers
+		[ -n "$( echo "$_PCI_slot" | grep -E "$_OFFLIMIT_PCI_SLOT_NUMS_GREP_STRING" )" ] && _PCI_slot="$( expr $_PCI_slot + 1)"
+
+		# Exit if above bhyve's maximum number of PCI slots but return the value of what is available. 31 is always used by the lpc
+		if [ "$_PCI_slot" -gt 30 ]; then
+			__log 1 "Can not attach any additional PCI devices to guest per bhyve, attaching what can be attached."
+			_BHYVE_slot_string="$_out_string"
+			return 0
+		fi
+
+		# String generation - where the magic happens
+		if [ "$_func" = 0 ]; then
+			local _out_string="$_out_string -s ${_PCI_slot},${_str}"
+		else
+			local _out_string="$_out_string -s ${_PCI_slot}:${_func},${_str}"
+		fi
+
+		# Must meet or be under bhyve's limit of 0-7 functions per PCI slot
+		if [ "$_func" -eq "$_per_slot" ]; then
+
+			# Reset function to 0
+			local _func=0
+
+			# Increment PCI Slot number
+			_PCI_slot=$( expr $_PCI_slot + 1)
+
+			# Increase counter for MAX slot checker
+			local _max_slot_count=$( expr $_max_slot_count + 1)
+
+			# MAX slot counter checker
+			if [ "$_max_slot_count" -gt "$_max_slot" ]; then
+
+				# Do not display the warning message for PCI Custom devices or when propery $_CONSOLIDATE_BHYVE_PCI_DEVICES is set to "yes".
+				[ "$_use_pci_funcions" != "yes" ] && __log 3 "Can not attach any additional devices to PCI slot $_PCI_slot."
+
+				# Return to the function that called this one after setting $_BHYVE_slot_string to what has been done.
+				_BHYVE_slot_string="$_out_string"
+				return 0
+			fi
+
+		# Increment PCI function number.
+		else
+
+			# Increment the PCI_slot number for the next device type when not ending on the last PCI function number
+			[ "$_device_counter" = "$_num_devices" ] && _PCI_slot=$( expr $_PCI_slot + 1)
+
+			# Increment the PCI function number
+			local _func=$( expr $_func + 1)
+		fi
+	done
+
+	# Return the value in the form of a global variable
+	_BHYVE_slot_string="$_out_string"
+}
+
+# Generates bhyve slot string for UEFI GOP code
+__generate_bhyve_vnc_string() {
+	local _string _vnc_h_res _vnc_w_res
+
+	# IP & Port
+	local _string="-s 2,fbuf,tcp=${_GP_uefi_vnc_ip}:${_GP_uefi_vnc_port}"
+
+	# Resolution
+	local _vnc_h_res="$( echo $_GP_uefi_vnc_res | cut -d'x' -f2 )"
+	local _vnc_w_res="$( echo $_GP_uefi_vnc_res | cut -d'x' -f1 )"
+	local _string="${_string},w=${_vnc_w_res},h=${_vnc_h_res}"
+
+	# VNC Pause boot until connect
+	[ "$_GP_uefi_vnc_pause_until_client_connect" = "yes" ] && local _string="${_string},wait"
+
+	# Assign to global variable
+	_BHYVE_vnc_string="$_string"
+}
+
+# Creates device.map for guest and places in /chyves/guests/$_guest/device.map
+__generate_generic_device_map() {
+	local _path="$1"
+	local _disk="$2"
+	local _iso="$3"
+	rm -f $_path/device.map
+	[ "$_disk" != "-" ] && printf '\(hd0\)\ '$_disk'\n' >> $_path/device.map
+	[ -n "$_iso" ] && printf '\(cd0\)\ '$_iso'\n' >> $_path/device.map
+}
+
+# Generates grub-bhyve command used to start guest.
+__generate_grub_bhyve_command() {
+	local _guest="$1"
+	local _iso="$2"
+	[ -n "$_iso" ] && local _media="/chyves/$_PRIMARY_POOL/ISO/$_iso/$_iso"
+	__gvset_guest_pool "$_guest"
+	__gvset_first_disk
+	__verify_binary_available "grub-bhyve"
+
+	# Handling for device.map file creation.
+	if [ $_GP_os = "custom" ]; then    # Do not create file, user supplied.
+		__log 2 "'os' property set as 'custom', user must supply 'device.map' and 'grub.cfg'."
+		__log 2 "Checking if 'device.map' and 'grub.cfg' files exists at: $_path"
+		[ ! -f "$_path/device.map" ] && __fault_detected_exit "'$_path/device.map' file does not exist, this file is required to property boot."
+		[ ! -f "$_path/grub.cfg" ] && __fault_detected_exit "'$_path/grub.cfg' file does not exist, this file is required to property boot."
+	elif [ -z "$_FIRST_disk" ]; then   # Handling when no hard disk is present (img or ZFS volume)
+		__generate_generic_device_map "$_GUEST_mountpoint" "-" "$_media"
+	else                               # Catch-all
+		__generate_generic_device_map "$_GUEST_mountpoint" "$_FIRST_disk" "$_media"
+	fi
+
+	# Boot from optical media when present.
+	if [ -n "$_media" ]; then
+		__log 2 "Booting grub-bhyve guest from optical media."
+		if [ $_GP_os = "openbsd60" ]; then
+			printf 'kopenbsd -h com0 (cd0)/6.0/amd64/bsd.rd\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "openbsd59" ]; then
+			printf 'kopenbsd -h com0 (cd0)/5.9/amd64/bsd.rd\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "openbsd58" ]; then
+			printf 'kopenbsd -h com0 (cd0)/5.8/amd64/bsd.rd\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "openbsd57" ]; then
+			printf 'kopenbsd -h com0 (cd0)/5.7/amd64/bsd.rd\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "netbsd" ]; then
+			printf 'knetbsd -h -r cd0a (cd0)/netbsd\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "debian" ] || [ $_GP_os = "d8lvm" ]; then
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r cd0 -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "centos6" ] || [ $_GP_os = "centos7" ]; then
+			printf 'linux (cd0)/isolinux/vmlinuz\ninitrd (cd0)/isolinux/initrd.img\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "arch" ]; then
+			printf 'linux (cd0)/arch/boot/x86_64/vmlinuz archisobasedir=arch archisolabel=ARCH_'$(date +%Y%m)' ro\ninitrd (cd0)/arch/boot/x86_64/archiso.img\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "gentoo" ]; then
+			printf 'linux (cd0)/isolinux/gentoo root=/dev/ram0 init=/linuxrc  dokeymap looptype=squashfs loop=/image.squashfs  cdroot \ninitrd (cd0)/isolinux/gentoo.igz\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "coreos" ]; then
+			printf 'linux (cd0)/coreos/vmlinuz coreos.autologin \ninitrd (cd0)/coreos/cpio.gz\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "coreossecure" ]; then
+			printf 'linux (cd0)/coreos/vmlinuz \ninitrd (cd0)/coreos/cpio.gz\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "custom" ]; then
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		else
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r cd0 -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		fi
+
+	# Boot from hard drive.
+	else
+		__log 2 "Booting grub-bhyve guest from hard drive."
+		if [ $_GP_os = "openbsd57" ] || [ $_GP_os = "openbsd58" ] || [ $_GP_os = "openbsd59" ] || [ $_GP_os = "openbsd60" ]; then
+			printf 'kopenbsd -h com0 -r sd0a (hd0,openbsd1)/bsd\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "netbsd" ]; then
+			printf 'knetbsd -h -r wd0a (hd0,msdos1)/netbsd\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "debian" ]; then
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r hd0,msdos1 -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "d8lvm" ]; then
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r hd0,msdos1 -d /grub -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "centos6" ]; then
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r hd0,msdos1 -d /grub -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "centos7" ]; then
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r hd0,msdos1 -d /grub2 -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "coreos" ]; then
+			printf 'linux (hd0,1)/coreos/vmlinuz-a ro root=LABEL=ROOT usr=LABEL=USR-A coreos.autologin\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "coreossecure" ]; then
+			printf 'linux (hd0,1)/coreos/vmlinuz-a ro root=LABEL=ROOT usr=LABEL=USR-A\nboot\n' > ${_GUEST_mountpoint}/grub.cfg
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		elif [ $_GP_os = "custom" ]; then
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r host -d ${_GUEST_mountpoint} -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		else
+			_LOADER_cmd="grub-bhyve $_GUEST_wire_memory -m ${_GUEST_mountpoint}/device.map -r hd0,msdos1 -c /dev/${_GP_serial}A -M $_GP_ram chy-$_guest"
+		fi
+	fi
+}
+
+# All inclusive start function
+__start() {
+	local _bhyve_exit_code _guests_list _loader_exit_code _media _uefi_usb3_mouse_string
+	local _guest_list="$1"
+	local _media="$2"
+
+	# Used for optical media ejection
+	[ -z "$_REBOOT_count" ] && _REBOOT_count=0
+
+	[ "$_guest_list" = all ] && local _guest_list="$_GUEST_NAMES_ACTIVE"
+
+	# Load kernel modules if set to or just check they are loaded.
+	if [ "$_AUTO_LOAD_KERNEL_MODS" = "yes" ]; then
+		__verify_all_kernel_modules -l      # This checks and loads the missing modules.
+	else
+		__verify_all_kernel_modules         # This only checks but does not load.
+	fi
+
+	# Multi-guest support.
+	# Eg.: chyves guest1,guest2,guest3 start install.iso
+	for _guest in `echo "$_guest_list" | tr ',' ' '`
+	do
+		[ "$_guest" = defaults ] && __fault_detected_warning_continue "Can not start defaults."
+		[ "$_guest" = global ] && __fault_detected_warning_continue "Can not start global."
+
+		__log 1 "Preparing to start guest: $_guest"
+		__log 2 "Loading guest parameters... " -n
+		__load_guest_parameters "$_guest"
+		__log 2 "done."
+
+		__log 2 "Checking if guest is running... " -n
+		[ -n "$( __return_guest_bhyve_pid )" ] && __fault_detected_warning_continue "Guest ($_GUEST_name) already running, PID: `__return_guest_bhyve_pid`\n"
+		__log 2 "not running."
+
+		# Revert to a previous snapshot state on start
+		if [ "$_GP_revert_to_snapshot_method" = "both" ] || [ "$_GP_revert_to_snapshot_method" = "start" ]; then
+
+			if [ -z "$_GP_revert_to_snapshot" ]; then
+				local _rollback_to_snapshot="$( __return_guest_snapshot_last )"
+				[ -z "$_rollback_to_snapshot" ] && __fault_detected_warning_continue "No snapshots taken for $_GUEST_name\n"
+			else
+				local _rollback_to_snapshot="$_GP_revert_to_snapshot"
+			fi
+
+			if [ ! "$_FIRST_snapshot_reload" ]; then
+				__verify_valid_dataset "guests/$_GUEST_name$_rollback_to_snapshot"
+
+				__log 2 "Reverting guest to state when snapshot '$_rollback_to_snapshot' was taken, including guest properties. (Start reversion)"
+
+				__rollback_guest_snapshot "$_rollback_to_snapshot"
+
+				__log 1 "Reloading guest properties as they may have changed."
+				__load_guest_parameters "$_guest"
+			fi
+		fi
+
+		# Do not let template guests start.
+		if [ "$_GP_template" = "yes" ]; then
+			__log 1 "$_GUEST_name is set as a template, not starting guest.\n"
+			continue
+		fi
+
+		# Do not let old chyves guest MAJOR versions from starting. If latest is 0105 and guest is 0100, guest will start, if latest is 0200 do not let 0199 start.
+		if [ "$( echo "$_VERSION_CHYVES_GUEST" | grep -o -E '^[0-9]{2}' | head -n1 )" -gt "$( echo "$_GP_chyves_guest_version" | grep -o -E '^[0-9]{2}' | head -n1 )" ]; then
+			__log 1 "$_GUEST_name is on an old chyves guest version ($_GP_chyves_guest_version), not starting guest.\n"
+			continue
+		fi
+
+		# Do not let newer chyves_guest_version guests start.
+		if  [ -z "$_GP_chyves_guest_version" ] || [ "$_VERSION_CHYVES_GUEST" -lt "$_GP_chyves_guest_version" ]; then
+			__log 1 "$_GUEST_name is on a newer chyves guest version ($_GP_chyves_guest_version), not starting guest.\n"
+			continue
+		fi
+
+		# Check and stop if loader is already running.
+		__stop_guest_loader
+
+		__log 2 "Checking if VMM resources allocated... " -n
+		[ "$( __return_guest_vmm_allocated )" ] && __fault_detected_exit "\nVMM resources already allocated. Please reclaim the VMM resources before starting the guest with: 'chyves $_GUEST_name reclaim'"
+		__log 2 "not allocated."
+
+		# Exit if starting a non-FreeBSD guest on an Intel host missing the UG CPU feature
+		if [ "$_CPU_MISSING_UG" ] && [ "$_GP_loader" != "bhyveload" ]; then
+			__return_cpu_section_from_dmesg
+			__fault_detected_warning_continue "Missing CPU feature UG, can only start FreeBSD guests.\n"
+		fi
+
+		# Used for optical media ejection, if set as guest property use that value, otherwise use global value.
+		if [ -n "$_GP_eject_iso_on_n_reboot" ]; then
+			local _eject_after_this_count="$_GP_eject_iso_on_n_reboot"
+			local _eject_iso_on_n_reboot_scope="guest"
+		elif [ -n "$_EJECT_ISO_ON_N_REBOOT" ]; then
+			local _eject_after_this_count="$_EJECT_ISO_ON_N_REBOOT"
+			local _eject_iso_on_n_reboot_scope="global"
+		else # Not needed but a fall back.
+			local _eject_after_this_count="0"
+		fi
+
+		# Set $_GUEST_disk_list in space delimited format for "for" loop below. Also set $_GUEST_disk_list_count.
+		__gvset_guest_disk_list -space
+
+		__log 2 "Checking which type of loader to use... " -n
+
+		# bhyveload
+		if [ "$_GP_loader" = "bhyveload" ]; then
+			__log 2 "bhyveload."
+
+			# If CPU feature "UG" is missing limit to one CPU
+			[ "${_CPU_MISSING_UG}" ] && _GP_cpu="1"
+
+			__log 2 "Generating command string for bhyveload... " -n
+			if [ -n "$_media" ]; then
+				__log 2 "using $_media as boot device... " -n
+				local _media_string_bhyveload="/chyves/$_PRIMARY_POOL/ISO/$_media/$_media"
+			else
+				__gvset_first_disk
+				__log 2 "using $_FIRST_disk as boot device... " -n
+				local _media_string_bhyveload="$_FIRST_disk"
+			fi
+			_LOADER_cmd="bhyveload $_GP_bhyveload_flags $_GUEST_wire_memory -m $_GP_ram -d $_media_string_bhyveload -c /dev/${_GP_serial}A chy-$_guest"
+			__log 2 "done."
+
+			__log 2 "Generating bhyve PCI string for $_GUEST_disk_list_count disks... " -n
+			__generate_bhyve_disk_string
+			__log 2 "done."
+
+		# grub-bhyve
+		elif [ "$_GP_loader" = "grub-bhyve" ]; then
+			__log 2 "grub-bhyve."
+
+			__log 2 "Generating command string for grub-bhyve... " -n
+			__generate_grub_bhyve_command "$_guest" "$_media"    # _LOADER_cmd is set here.
+			__log 2 "done."
+
+			__log 2 "Generating bhyve PCI string for $_GUEST_disk_list_count disks... " -n
+			__generate_bhyve_disk_string
+			__log 2 "done."
+
+		# uefi
+		elif [ "$_GP_loader" = "uefi" ]; then
+			__log 2 "UEFI."
+
+			# Check if firmware is set for guest
+			[ $_GP_uefi_firmware = '-' ] && __fault_detected_exit "You must set a firmware resource name to boot a UEFI guest..."
+
+			__log 2 "Generating bhyve string for UEFI firmware... " -n
+			_BHYVE_uefi_firmware_string="-l bootrom,/chyves/$_PRIMARY_POOL/Firmware/$_GP_uefi_firmware/$_GP_uefi_firmware"
+			__log 2 "done."
+
+			# Optical Media is required by UEFI
+			[ -z "$_media" ] && local _media="null.iso"
+
+			__log 2 "Generating bhyve PCI string for $_GUEST_disk_list_count disks... " -n
+			__generate_bhyve_disk_string
+			__log 2 "done."
+
+			# Special handling for VNC console
+			if [ "$_GP_uefi_console_output" = "vnc" ] && [ "$_OS_VERSION_DATE" -ge "1100000" ]; then
+
+				__log 2 "Generating bhyve PCI string for VNC console... " -n
+				__generate_bhyve_vnc_string
+				_BHYVE_console_string="$_BHYVE_vnc_string"
+				__log 2 "done."
+
+				# Attach USB 3.0 Mouse? - Only useful for VNC.
+				__log 2 "Generating bhyve PCI string for mouse... " -n
+				if [ "$_GP_uefi_vnc_mouse_type" = "usb3" ]; then
+					__log 2 "xHCI mouse... " -n
+					local _uefi_usb3_mouse_string="xhci,tablet"
+					__generate_bhyve_slot_string "$_uefi_usb3_mouse_string"
+					_BHYVE_uefi_usb3_string="$_BHYVE_slot_string"
+					__log 2 "done."
+				else
+					__log 2 "PS/2 mouse... done."
+				fi
+			elif [ "$_GP_uefi_console_output" = "vnc" ] && [ "$_OS_VERSION_DATE" -lt "1100000" ]; then
+				__log 1 "Only hosts running on FreeBSD version 11 or later are capable of utilize a VNC console output due to new kernel changes."
+			fi
+		fi
+
+		# Declare console if UEFI VNC did not set this value
+		[ -z "$_BHYVE_console_string" ] && _BHYVE_console_string="-l com1,/dev/${_GP_serial}A"
+
+		# Attach media if present. Always use 3 due to UEFI requiring ahci devices on PCI slots 3-6 && simplicity.
+		[ -n "$_media" ] && _BHYVE_optical_media_string="-s 3,ahci-cd,/chyves/$_PRIMARY_POOL/ISO/$_media/$_media"
+
+		__log 2 "Generating bhyve string for network devices... "
+		__generate_bhyve_net_string $_GUEST_name
+		__log 2 "   ...done."
+
+		__log 2 "Generating bhyve string for custom PCI devices (if any)... " -n
+		__generate_bhyve_custom_pci_string
+		__log 2 "done."
+
+		__log 3 "loader command ($_GP_loader):"
+		__log 3 "$_LOADER_cmd"
+		__log 3 "bhyve command:"
+		__log 3 "bhyve $_GP_bargs -c $_GP_cpu -U $_GP_uuid -m $_GP_ram -s 0,hostbridge $_BHYVE_optical_media_string $_BHYVE_disk_string $_BHYVE_net_string $_BHYVE_custom_pci_string $_BHYVE_console_string $_BHYVE_uefi_usb3_string $_BHYVE_uefi_firmware_string -s 31,lpc chy-$_guest"
+
+
+		# Start this portion in a seperated process
+		(
+			__log 1 "Starting $_GUEST_name"
+			# Use while loop to make sure guest will reboot correctly.
+			while [ 1 ]
+			do
+				_PCI_slot="$_PCI_SLOT_START"      # Reset $_PCI_slot value for next multi-guest.
+
+				# Eject optical media after reboot
+				if [ "$_REBOOT_count" = "$_eject_after_this_count" ] && [ ! "$_EJECT_media_once" ] && [ "$_eject_after_this_count" != 0 ]; then
+
+					# Keep from continual looping
+					_EJECT_media_once=1
+
+					# Clear out global variable for optical media
+					_BHYVE_optical_media_string=""
+
+					__log 1 "Stopping guest completely to reload without optical media using the $_eject_iso_on_n_reboot_scope property 'eject_iso_on_n_reboot' value '$_eject_after_this_count'."
+					bhyvectl --destroy --vm=chy-$_guest
+
+					# A complete reload is needed to repopulate _LOADER_cmd.
+					__log 1 "Restarting the guest without optical media attached."
+					__start $_GUEST_name
+					exit
+				fi
+
+				# Special handling for non-UEFI guests - UEFI does not need a loader as it uses the firmware to boot.
+				if [ "$_GP_loader" != "uefi" ]; then
+
+					# Execute the loader
+					$_LOADER_cmd
+
+					# Save the loader exit code
+					local _loader_exit_code="$?"
+					__log 3 "Exit code for $_GP_loader guest '$_GUEST_name' was '$_loader_exit_code'"
+
+					# Only exit codes of "0" are properly functioning.
+					if [ "$_loader_exit_code" -ne 0 ]; then
+						__log 2 "Reclaiming $_GUEST_name VMM resources... "
+						bhyvectl --destroy --vm=chy-$_guest
+						__fault_detected_exit "$_GP_loader exited with a '$_loader_exit_code' code. '0' is the expected code for proper booting. Halting boot process for $_GUEST_name."
+					fi
+				fi
+
+				# Execute bhyve - Blank variables just create additional whitespace which is ignored.
+				bhyve $_GP_bargs -c $_GP_cpu -U $_GP_uuid -m $_GP_ram -s 0,hostbridge $_BHYVE_optical_media_string $_BHYVE_disk_string $_BHYVE_net_string $_BHYVE_custom_pci_string $_BHYVE_console_string $_BHYVE_uefi_usb3_string $_BHYVE_uefi_firmware_string -s 31,lpc chy-$_guest
+				# Is it not the least bit amusing this tool exists because of the <insert-judgemental-adjective> of not want to enter the command above by hand.
+
+				# Save bhyve's exit code
+				local _bhyve_exit_code="$?"
+				__log 3 "Exit code for bhyve guest '$_GUEST_name' was '$_bhyve_exit_code'"
+
+				# Only reboots will exit with a code "0", all other exit codes need to destroy the VMM resources and exit
+				if [ "$_bhyve_exit_code" != 0 ]; then
+					__log 1 "Powering off $_GUEST_name... "
+					__log 2 "Reclaiming $_GUEST_name VMM resources... "
+					bhyvectl --destroy --vm=chy-$_guest
+					exit $_bhyve_exit_code
+				fi
+
+				# Used to know when to eject disk. Snapshot reversion requires either two entries or setting variable before reversion handling.
+				_REBOOT_count="$( expr $_REBOOT_count + 1 )"
+
+				# Revert to a previous snapshot state on reboot
+				if [ "$_GP_revert_to_snapshot_method" = "both" ] || [ "$_GP_revert_to_snapshot_method" = "reboot" ]; then
+
+					if [ -z "$_GP_revert_to_snapshot" ]; then
+						local _rollback_to_snapshot="$( __return_guest_snapshot_last )"
+						[ -z "$_rollback_to_snapshot" ] && __fault_detected_exit "No snapshots taken for $_GUEST_name"
+					else
+						local _rollback_to_snapshot="$_GP_revert_to_snapshot"
+					fi
+
+					__verify_valid_dataset "guests/$_GUEST_name$_rollback_to_snapshot"
+
+					__log 2 "Reverting guest to state when snapshot '$_rollback_to_snapshot' was taken, including guest properties. (Reboot reversion)"
+
+					__rollback_guest_snapshot "$_rollback_to_snapshot"
+
+					# First, this stops the guest completely to allow for a restart of the guest with (potential) new settings.
+					# Second, this will not run a second time because at that point the reversion has happened and the guest properties do not need to be reloaded, only the disks need to reverted.
+					if [ ! "$_FIRST_snapshot_reload" ]; then
+
+						# This prevents a guest from getting reverted again.
+						_FIRST_snapshot_reload=1
+
+						__log 1 "Stopping guest completely to reload settings"
+						bhyvectl --destroy --vm=chy-$_guest
+
+						# This starts the guest in a separate process (effectively) because of the '( while[1] ) &' statement.
+						__log 1 "Restarting the guest."
+						__start $_GUEST_name $2
+						exit
+					fi
+				fi
+
+				__log 1 "Rebooting $_GUEST_name... "
+				__log 3 "Number of reboots: $_REBOOT_count"
+				sleep 5
+			done
+		) &
+
+		echo ""                           # Create visual space for next multi-guest.
+		_BHYVE_console_string=""          # Reset $_BHYVE_console_string value for next multi-guest.
+	done
+}
+
+# Verify I/O MMU (iommu) for guests using PCI passthrough
+__verify_iommu_capable() {
+	local _acpidump=$( acpidump -t | grep DMAR )
+
+	# CPU missing DMAR are not VT-d capable.
+	if [ -z "$_acpidump" ]; then
+		__return_cpu_section_from_dmesg
+		__fault_detected_exit "CPU missing I/O MMU capability or is disabled in the BIOS. \nPCI Passthrough requires I/O MMU to function. \nPlease check your CPU manufacture's spec page for your CPU. \nI/O MMU is called AMD-Vi for AMD CPUs and VT-d for Intel CPUs."
+	fi
+}
