@@ -65,7 +65,7 @@ zfs create -o mountpoint=/var ${ZPOOL}/var
 zfs create -o mountpoint=/opt ${ZPOOL}/opt
 zfs create -o mountpoint=/usbkey ${ZPOOL}/usbkey
 
-TMPFILE=`mktemp -m 0700 -q /tmp/ssh.XXXXXX`
+TMPFILE=`mktemp -q /tmp/ssh.XXXXXX`
 if [ $? -ne 0 ]; then
     echo "$0: Can't create temp file, exiting..."
     exit 1
