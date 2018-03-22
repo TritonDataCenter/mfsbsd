@@ -3,7 +3,7 @@
 # Create zfs datasets for triton
 #
 # zfs_create.sh [-n poolname] devices/partition
-# 
+#
 # example: zfs_create.sh -n zroot da0p2 da1p2
 #
 
@@ -64,5 +64,16 @@ zfs create -o mountpoint=/tmp ${ZPOOL}/tmp
 zfs create -o mountpoint=/var ${ZPOOL}/var
 zfs create -o mountpoint=/opt ${ZPOOL}/opt
 zfs create -o mountpoint=/usbkey ${ZPOOL}/usbkey
+
+TMPFILE=`mktemp -m 0700 -q /tmp/ssh.XXXXXX`
+if [ $? -ne 0 ]; then
+    echo "$0: Can't create temp file, exiting..."
+    exit 1
+fi
+trap "{ rm -f $TMPFILE; }" EXIT
+
+cd /etc/ssh && tar cpf "${TMPFILE}" .
+zfs create -o mountpoint=/etc/ssh "${ZPOOL}/etc-ssh"
+cd /etc/ssh && tar xpf "${TMPFILE}"
 
 exit 0
