@@ -65,6 +65,7 @@ chmod 1777 ${ZPOOL}/tmp
 zfs create -o mountpoint=/var ${ZPOOL}/var
 zfs create -o mountpoint=/opt ${ZPOOL}/opt
 zfs create -o mountpoint=/usbkey ${ZPOOL}/usbkey
+zfs create -o mountpoint=/images ${ZPOOL}/images
 
 TMPFILE=`mktemp -q /tmp/ssh.XXXXXX`
 if [ $? -ne 0 ]; then
