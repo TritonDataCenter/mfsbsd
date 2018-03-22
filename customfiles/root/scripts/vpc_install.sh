@@ -11,4 +11,4 @@ set -e
 set -u
 
 /usr/local/bin/go get github.com/joyent/freebsd-vpc/cmd/vpc
-/usr/bin/install -h -g wheel -o root -m 0755 $(/usr/local/bin/go env GOPATH)/bin/vpc /usr/local/bin
+/usr/bin/install -g wheel -o root -m 0755 $(/usr/local/bin/go env GOPATH)/bin/vpc /usr/local/bin
