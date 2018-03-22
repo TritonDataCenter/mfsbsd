@@ -1,0 +1,20 @@
+#!/bin/sh --
+
+UPLINK_IF=cc0
+VNI=123
+
+VPCSW0_ID=da64c3f3-095d-91e5-df01-5aabcfc52468
+ETHLINK0_ID=5c4acd32-1b8d-11e8-b408-0cc47a6c7d1e
+UPLINK_PORT_ID=ea58b648-203b-a707-cdf6-7a552c8d5295
+
+VMNIC0_ID=07f95a11-6788-2ae7-c306-ba95cff1db39
+VPCP0_ID=fd436f9c-1f77-11e8-8002-0cc47a6c7d1e
+
+DISKPATH=/dev/zvol/zones/chyves/guests/
+CONFIGPATH=/chyves/zones/guests
+
+GUEST0=tomas0
+GUEST0_UUID=ec30b988-f5aa-11e7-a76c-ac1f6b0a8cd2 
+GUEST0_NMDM=/dev/nmdm52A
+GUEST0_MEM=4G
+GUEST0_CPUS=8
