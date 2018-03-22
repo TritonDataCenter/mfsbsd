@@ -6,12 +6,18 @@ set -u
 
 . /root/scripts/testing/3Q5WMK2/input.sh
 
-VMNAME=${GUEST0_NAME}
-NMDM_DEV=${GUEST0_NMDM}
-MEM=${GUEST0_MEM}
-CPUS=${GUEST0_CPUS}
-VMID=${GUEST0_UUID}
-VMNIC_ID=${VMNIC0_ID}
+if [ -z "$1" ]; then
+	printf "error: Please specify the VM ID\n"
+	exit 1
+fi
+ID=$1
+
+eval VMNAME="\${GUEST${ID}_NAME}"
+eval NMDM_DEV="\${GUEST${ID}_NMDM}"
+eval MEM="\${GUEST${ID}_MEM}"
+eval CPUS="\${GUEST${ID}_CPUS}"
+eval VMID="\${GUEST${ID}_UUID}"
+eval VMNIC_ID="\${VMNIC${ID}_ID}"
 
 grub-bhyve -S \
            -m ${CONFIGPATH}/${VMNAME}/device.map \
