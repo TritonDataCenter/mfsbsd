@@ -73,7 +73,7 @@ __dataset_install() {
 		__write_property_value_to_config_file "defaults" "bridge"                               "bridge0"
 		__write_property_value_to_config_file "defaults" "cpu"                                  "1"
 		__write_property_value_to_config_file "defaults" "disk_volmode"                         "dev"
-		__write_property_value_to_config_file "defaults" "disk_volblocksize"                    "128"
+		__write_property_value_to_config_file "defaults" "disk_volblocksize"                    "131072"
 		__write_property_value_to_config_file "defaults" "disk_dedup"                           "inherit"
 		__write_property_value_to_config_file "defaults" "disk_compression"                     "inherit"
 		__write_property_value_to_config_file "defaults" "disk_primarycache"                    "inherit"
