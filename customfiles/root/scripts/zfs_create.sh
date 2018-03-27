@@ -46,19 +46,19 @@ DEVICES=${@}
 # List pools so that we can abort if a pool with the provided name exists
 # already.
 #
-if ! pools="$(zpool list -Ho name)"; then
-	echo "could not list ZFS pools." 1>&2
-	exit 1
-fi
-
-for pool in $pools; do
-	if [ "$pool" == "$ZPOOL" ]; then
-		echo "zpool with name ${ZPOOL} already exists." 1>&2
-		exit 1
-	fi
-done
-
-zpool create ${ZPOOL} ${DEVICES}
+#if ! pools="$(zpool list -Ho name)"; then
+#	echo "could not list ZFS pools." 1>&2
+#	exit 1
+#fi
+#
+#for pool in $pools; do
+#	if [ "$pool" == "$ZPOOL" ]; then
+#		echo "zpool with name ${ZPOOL} already exists." 1>&2
+#		exit 1
+#	fi
+#done
+#
+#zpool create ${ZPOOL} ${DEVICES}
 zfs create -o mountpoint=/zones ${ZPOOL}/zones
 zfs create -o mountpoint=/tmp ${ZPOOL}/tmp
 chmod 1777 ${ZPOOL}/tmp
