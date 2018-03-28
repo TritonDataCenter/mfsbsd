@@ -61,6 +61,7 @@ done
 zpool create ${ZPOOL} ${DEVICES}
 zfs create -o mountpoint=/zones ${ZPOOL}/zones
 zfs create -o mountpoint=/tmp ${ZPOOL}/tmp
+chmod 1777 ${ZPOOL}/tmp
 zfs create -o mountpoint=/var ${ZPOOL}/var
 zfs create -o mountpoint=/opt ${ZPOOL}/opt
 zfs create -o mountpoint=/usbkey ${ZPOOL}/usbkey
